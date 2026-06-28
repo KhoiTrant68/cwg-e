@@ -128,7 +128,8 @@ def main():
                          **{name: round(series[name][i], 6) for name in series}))
         print(f"[thm_no_spurious] alpha={a:.2f}  "
               f"global={series['global_K1'][i]:.4f}  "
-              f"cluster={series['cluster_K'][i]:.4f}  "
+              f"cluster_block={series['cluster_block'][i]:.4f}  "
+              f"cluster_per={series['cluster_per'][i]:.4f}  "
               f"meanshift={series['meanshift'][i]:.4f}")
 
     # plot — log y to make the "vanishes at α=1" claim visually clear
