@@ -87,6 +87,12 @@ def _train_one(
         _, c = batched_kmeans(real_pool_t.unsqueeze(0), K=n_clusters, num_iter=30)
         centroids_fixed = c.squeeze(0)        # [K, D]
 
+    # For training, hard mode uses BLOCK-MASK (not per-cluster): per-cluster
+    # Sinkhorn produces V = 0 for points whose cluster is empty on the gen
+    # side, which permanently traps mode-collapsed runs. Block-mask leaks a
+    # small amount of mass through dual potentials and lets training recover.
+    use_per_cluster_sinkhorn = False
+
     t0 = time.time()
     for step in range(steps):
         z = torch.randn(batch, 2, device=dev)
@@ -112,7 +118,7 @@ def _train_one(
             n_clusters=n_clusters,
             mask_lambda=1.0,
             cluster_centroids=centroids_fixed,
-            use_per_cluster_sinkhorn=True,
+            use_per_cluster_sinkhorn=use_per_cluster_sinkhorn,
         )
         opt.zero_grad()
         loss.mean().backward()

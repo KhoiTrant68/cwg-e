@@ -59,7 +59,7 @@ def _bench_one(q: torch.Tensor, p: torch.Tensor, mode: str, K: int,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--Ns", nargs="+", type=int,
-                        default=[128, 256, 512, 1024, 2048])
+                        default=[256, 512, 1024, 2048, 4096, 8192])
     parser.add_argument("--Ks", nargs="+", type=int, default=[4, 8, 16])
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--num-iter", type=int, default=20)

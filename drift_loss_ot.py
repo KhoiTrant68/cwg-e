@@ -533,6 +533,23 @@ def _sinkhorn_small(
 
 
 @torch.no_grad()
+def _per_cluster_positions(labels: torch.Tensor, K: int) -> torch.Tensor:
+    """For each point i, its rank within its cluster.
+
+    Returns [N] int64 with values in [0, max_cluster_size).
+    """
+    N = labels.shape[0]
+    device = labels.device
+    pos = torch.zeros(N, device=device, dtype=torch.long)
+    for k in range(int(K)):
+        mask = labels == k
+        nk = int(mask.sum().item())
+        if nk:
+            pos[mask] = torch.arange(nk, device=device)
+    return pos
+
+
+@torch.no_grad()
 def _per_cluster_bary(
     z: torch.Tensor,           # [B, N, D]
     support: torch.Tensor,     # [B, M, D]
@@ -544,35 +561,74 @@ def _per_cluster_bary(
     target_weights: torch.Tensor | None = None,   # [B, M]
     use_quadratic_cost: bool = False,
 ) -> torch.Tensor:
-    """K independent Sinkhorn problems within each cluster.
+    """K independent Sinkhorn problems within each cluster — batched.
 
-    Real speedup vs the block-mask Sinkhorn: total cost ≈ K * (N/K)^2 = N^2/K
-    instead of N^2. Loops over (B, K); fine for small K. For empty z-clusters
-    the corresponding rows of T are left at z (zero velocity contribution).
+    Builds padded [K, max_nz, D] / [K, max_ms, D] tensors and routes a SINGLE
+    batched Sinkhorn call (B'=K) instead of K Python iterations. Total
+    Sinkhorn cost ≈ K * max_nz * max_ms (≈ N^2 / K in the balanced case),
+    vs N^2 for the block-mask path.
+
+    Empty-cluster handling: clusters with empty z stay at identity in T (so
+    V contribution = 0). Clusters with empty support same — masked out via
+    a dummy weight then their rows of T are not used.
     """
     B, N, D = z.shape
-    T = z.clone()  # default: identity, so V contribution is 0 for empty clusters
+    M = support.shape[1]
+    device, dtype = z.device, z.dtype
+    T = z.clone()
+    K = int(K)
+
     for b in range(B):
-        for k in range(int(K)):
-            zmask = labels_z[b] == k
-            smask = labels_s[b] == k
-            nz = int(zmask.sum().item())
-            ms = int(smask.sum().item())
-            if nz == 0:
-                continue
-            if ms == 0:
-                # cluster has no support points: keep z (T = z) so V_pos = V_neg = 0
-                continue
-            zk = z[b, zmask]
-            sk = support[b, smask]
-            tw = None if target_weights is None else target_weights[b, smask]
-            Pi = _sinkhorn_small(
-                zk, sk, eps=eps, num_iter=num_iter,
-                target_weights=tw, use_quadratic_cost=use_quadratic_cost,
-            )
-            row_mass = Pi.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-            Tk = Pi @ sk / row_mass
-            T[b, zmask] = Tk
+        lz = labels_z[b]                            # [N]
+        ls = labels_s[b]                            # [M]
+        nz_per_k = torch.bincount(lz, minlength=K)
+        ns_per_k = torch.bincount(ls, minlength=K)
+        nonempty = (nz_per_k > 0) & (ns_per_k > 0)
+        if not bool(nonempty.any().item()):
+            continue
+        max_nz = int(nz_per_k.max().item())
+        max_ms = int(ns_per_k.max().item())
+
+        pos_z = _per_cluster_positions(lz, K)
+        pos_s = _per_cluster_positions(ls, K)
+
+        _PAD_VAL = 1e4
+        z_pad = z.new_full((K, max_nz, D), _PAD_VAL)
+        s_pad = z.new_full((K, max_ms, D), _PAD_VAL)
+        s_w = z.new_zeros((K, max_ms))
+        z_pad[lz, pos_z] = z[b]
+        s_pad[ls, pos_s] = support[b]
+        if target_weights is None:
+            s_w[ls, pos_s] = 1.0
+        else:
+            s_w[ls, pos_s] = target_weights[b]
+
+        # For clusters with empty support, plant a dummy weight at position 0
+        # so the Sinkhorn b-marginal isn't zero (would log(0) → -inf).
+        # Those clusters' T rows are discarded later via the nonempty mask.
+        empty_s_mask = ~(ns_per_k > 0)
+        if bool(empty_s_mask.any().item()):
+            s_w[empty_s_mask, 0] = 1.0
+
+        reg_per_k = torch.full((K,), float(eps), device=device, dtype=dtype)
+        dm_per_k = torch.zeros(K, device=device, dtype=torch.bool)
+
+        Pi = _sinkhorn_batched(
+            z_pad, s_pad, reg_per_k, dm_per_k, num_iter, s_w,
+            use_quadratic_cost=use_quadratic_cost,
+        )                                            # [K, max_nz, max_ms]
+        row_mass = Pi.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        T_pad = torch.bmm(Pi, s_pad) / row_mass      # [K, max_nz, D]
+
+        # Scatter back; only for points whose cluster is non-empty on BOTH sides.
+        # Other points keep T = z (identity, contributing 0 to V_pos - V_neg).
+        valid_at_point = nonempty[lz]                # [N]
+        T_b = z[b].clone()
+        idx_k = lz[valid_at_point]
+        idx_p = pos_z[valid_at_point]
+        T_b[valid_at_point] = T_pad[idx_k, idx_p]
+        T[b] = T_b
+
     return T
 
 
