@@ -61,7 +61,9 @@ def _V_global(q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
 
 def _V_cluster(q: torch.Tensor, p: torch.Tensor, K: int,
                centroids: torch.Tensor | None = None,
-               use_per_cluster: bool = True) -> torch.Tensor:
+               use_per_cluster: bool = True,
+               use_outer_gamma: bool = False,
+               outer_gamma_eps: float = 0.1) -> torch.Tensor:
     eps = torch.tensor(0.05 * (q.shape[-1] ** 0.5), device=q.device)
     return _compute_V_clustered(
         q[None], p[None], q[None].detach(),
@@ -70,6 +72,8 @@ def _V_cluster(q: torch.Tensor, p: torch.Tensor, K: int,
         num_iter=30,
         cluster_centroids=centroids,
         use_per_cluster_sinkhorn=use_per_cluster,
+        use_outer_gamma=use_outer_gamma,
+        outer_gamma_eps=outer_gamma_eps,
     )[0]
 
 
@@ -103,7 +107,8 @@ def main():
 
     rows = []
     series = {name: np.zeros(len(alphas)) for name in
-              ("global_K1", "cluster_block", "cluster_per", "meanshift")}
+              ("global_K1", "cluster_block", "cluster_per",
+               "cluster_per_outerG", "meanshift")}
     err = {name: np.zeros(len(alphas)) for name in series}
 
     for i, a in enumerate(alphas):
@@ -120,6 +125,13 @@ def main():
                                                   centroids=cents_K,
                                                   use_per_cluster=True
                                                   ).pow(2).sum(-1).mean().item())
+            vals["cluster_per_outerG"].append(
+                _V_cluster(q_t, p_t, args.n_clusters,
+                           centroids=cents_K,
+                           use_per_cluster=True,
+                           use_outer_gamma=True,
+                           outer_gamma_eps=0.1
+                           ).pow(2).sum(-1).mean().item())
             vals["meanshift"].append(_V_meanshift(q_t, p_t).pow(2).sum(-1).mean().item())
         for name in series:
             series[name][i] = float(np.mean(vals[name]))
@@ -130,20 +142,24 @@ def main():
               f"global={series['global_K1'][i]:.4f}  "
               f"cluster_block={series['cluster_block'][i]:.4f}  "
               f"cluster_per={series['cluster_per'][i]:.4f}  "
+              f"cluster_per_outerG={series['cluster_per_outerG'][i]:.4f}  "
               f"meanshift={series['meanshift'][i]:.4f}")
 
     # plot — log y to make the "vanishes at α=1" claim visually clear
     fig, ax = plt.subplots(figsize=(8.0, 4.8))
     labels = {
-        "global_K1":     "Global Sinkhorn (W-Flow, K=1)",
-        "cluster_block": f"CWG-E block-mask (K={args.n_clusters})",
-        "cluster_per":   f"CWG-E per-cluster (K={args.n_clusters})",
-        "meanshift":     "Heuristic mean-shift (Drifting-style)",
+        "global_K1":          "Global Sinkhorn (W-Flow, K=1)",
+        "cluster_block":      f"CWG-E block-mask (K={args.n_clusters})",
+        "cluster_per":        f"CWG-E per-cluster (K={args.n_clusters})",
+        "cluster_per_outerG": f"CWG-E per-cluster + outer Γ (K={args.n_clusters})",
+        "meanshift":          "Heuristic mean-shift (Drifting-style)",
     }
-    colors = {"global_K1": "#185FA5", "cluster_block": "#0F6E56",
-              "cluster_per": "#7A55C9", "meanshift": "#D85A30"}
+    colors = {"global_K1": "#185FA5", "cluster_block": "#888888",
+              "cluster_per": "#7A55C9", "cluster_per_outerG": "#0F6E56",
+              "meanshift": "#D85A30"}
     markers = {"global_K1": "o", "cluster_block": "s",
-               "cluster_per": "^", "meanshift": "o"}
+               "cluster_per": "^", "cluster_per_outerG": "D",
+               "meanshift": "o"}
     for name in series:
         y = np.clip(series[name], 1e-6, None)
         ax.errorbar(alphas, y, yerr=err[name],
@@ -152,13 +168,20 @@ def main():
     ax.set_yscale("log")
     ax.set_xlabel("α   (q = p at α = 1; mode 0 missing at α = 0)")
     ax.set_ylabel(r"mean  $\|V(x)\|^2$  (log)")
-    ax.set_title("Thm 2: block-mask vanishes iff q=p; per-cluster has spurious eq.")
+    ax.set_title("Thm 2: outer Γ restores vanish-at-q=p for per-cluster CWG-E")
     ax.annotate(
-        "per-cluster flat → spurious eq.\n(blind to missing-cluster mass)",
+        "per-cluster flat → spurious eq.",
         xy=(0.1, series["cluster_per"][1]),
-        xytext=(0.2, max(series["cluster_per"][1] * 8, 5e-4)),
+        xytext=(0.18, max(series["cluster_per"][1] * 12, 7e-4)),
         arrowprops=dict(arrowstyle="->", color="#7A55C9", lw=1.0),
         color="#7A55C9", fontsize=8,
+    )
+    ax.annotate(
+        "+ outer Γ: drops monotonically",
+        xy=(0.05, series["cluster_per_outerG"][0]),
+        xytext=(0.25, max(series["cluster_per_outerG"][0] * 1.6, 3e-2)),
+        arrowprops=dict(arrowstyle="->", color="#0F6E56", lw=1.0),
+        color="#0F6E56", fontsize=8,
     )
     ax.legend(loc="lower left", fontsize=8)
     ax.grid(alpha=0.3, which="both")

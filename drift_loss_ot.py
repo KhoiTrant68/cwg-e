@@ -633,6 +633,86 @@ def _per_cluster_bary(
 
 
 @torch.no_grad()
+def _sinkhorn_AB(
+    C: torch.Tensor,             # [B, K, K] cost
+    a: torch.Tensor,             # [B, K] source marginal (may have zeros)
+    b: torch.Tensor,             # [B, K] target marginal (may have zeros)
+    reg: float,
+    num_iter: int = 50,
+) -> torch.Tensor:
+    """Log-domain Sinkhorn with both marginals; safe for zero entries."""
+    log_a = torch.log(a.clamp_min(1e-30))
+    log_b = torch.log(b.clamp_min(1e-30))
+    logK = -C / float(reg)
+    log_u = torch.zeros_like(log_a)
+    log_v = torch.zeros_like(log_b)
+    for _ in range(max(int(num_iter), 1)):
+        log_u = log_a - torch.logsumexp(logK + log_v[:, None, :], dim=-1)
+        log_v = log_b - torch.logsumexp(logK.transpose(1, 2) + log_u[:, None, :], dim=-1)
+    return torch.exp(log_u[:, :, None] + logK + log_v[:, None, :])
+
+
+@torch.no_grad()
+def _outer_gamma_targets(
+    centroids_p: torch.Tensor,     # [B, K, D]   target-side centroids
+    centroids_q: torch.Tensor,     # [B, K, D]   source-side centroids
+    marg_q: torch.Tensor,          # [B, K]      q cluster sizes (normalised)
+    marg_p: torch.Tensor,          # [B, K]      p cluster sizes (normalised)
+    eps_gamma: float,
+    num_iter: int = 50,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Outer centroid-to-centroid Sinkhorn coupling Γ.
+
+    Returns:
+        beta:        [B, K]    diagonal weight of Γ per source cluster
+                              (β_k = 1 → all mass stays within cluster).
+        off_target:  [B, K, D] weighted average of OFF-diagonal target
+                              centroids, per source cluster.
+    """
+    # Cost between centroid pairs, scaled by their typical spread.
+    C = torch.cdist(centroids_q, centroids_p) ** 2
+    scale = C.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-12)
+    C = C / scale
+    Gamma = _sinkhorn_AB(C, marg_q, marg_p, reg=eps_gamma, num_iter=num_iter)
+
+    Gamma_row = Gamma / Gamma.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    K = Gamma.shape[-1]
+    eye = torch.eye(K, dtype=torch.bool, device=Gamma.device).unsqueeze(0)
+    beta = Gamma_row.diagonal(dim1=-2, dim2=-1)                       # [B, K]
+
+    Gamma_off = Gamma_row.masked_fill(eye, 0.0)                       # [B, K, K]
+    off_sum = Gamma_off.sum(dim=-1, keepdim=True).clamp_min(1e-12)    # [B, K, 1]
+    off_target = torch.bmm(Gamma_off, centroids_p) / off_sum          # [B, K, D]
+
+    return beta, off_target
+
+
+@torch.no_grad()
+def _apply_outer_gamma(
+    T_within: torch.Tensor,   # [B, N, D]   within-cluster barycentric
+    labels_z: torch.Tensor,   # [B, N]
+    beta: torch.Tensor,       # [B, K]
+    off_target: torch.Tensor, # [B, K, D]
+) -> torch.Tensor:
+    """T̃(x_i) = β_{k_i} · T_within(x_i) + (1-β_{k_i}) · off_target_{k_i}."""
+    beta_pp = beta.gather(1, labels_z)                                # [B, N]
+    D = T_within.shape[-1]
+    off_pp = off_target.gather(
+        1, labels_z.unsqueeze(-1).expand(-1, -1, D),
+    )                                                                  # [B, N, D]
+    return beta_pp.unsqueeze(-1) * T_within + (1 - beta_pp.unsqueeze(-1)) * off_pp
+
+
+@torch.no_grad()
+def _cluster_marginals(labels: torch.Tensor, K: int) -> torch.Tensor:
+    """Per-batch normalised cluster mass. Returns [B, K], rows sum to 1."""
+    B, N = labels.shape
+    m = torch.zeros(B, K, device=labels.device, dtype=torch.float32)
+    m.scatter_add_(1, labels, torch.ones_like(labels, dtype=torch.float32))
+    return m / m.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+@torch.no_grad()
 def _compute_V_clustered(
     z: torch.Tensor,
     w_pos: torch.Tensor,
@@ -648,6 +728,8 @@ def _compute_V_clustered(
     use_quadratic_cost: bool = False,
     cluster_centroids: torch.Tensor | None = None,
     use_per_cluster_sinkhorn: bool = True,
+    use_outer_gamma: bool = False,
+    outer_gamma_eps: float = 0.1,
 ) -> torch.Tensor:
     """Cluster-wise debiased OT velocity V = T_pq - T_qneg (+ optional CFG).
 
@@ -698,6 +780,26 @@ def _compute_V_clustered(
             target_weights=neg_target_weights,
             use_quadratic_cost=use_quadratic_cost,
         )
+
+        # Outer Γ correction: cluster-to-cluster Sinkhorn over centroids
+        # restores the "vanishes iff q=p" property by routing mass between
+        # source clusters whose marginal is non-zero and target clusters
+        # whose marginal is non-zero, even when one side is empty.
+        if use_outer_gamma:
+            cz = _cluster_marginals(labels_z, n_clusters).to(z.dtype)
+            cp = _cluster_marginals(labels_p, n_clusters).to(z.dtype)
+            cn = _cluster_marginals(labels_n, n_clusters).to(z.dtype)
+            beta_p, off_p = _outer_gamma_targets(
+                centroids, centroids, cz, cp,
+                eps_gamma=outer_gamma_eps, num_iter=num_iter,
+            )
+            T_pq = _apply_outer_gamma(T_pq, labels_z, beta_p, off_p)
+            beta_n, off_n = _outer_gamma_targets(
+                centroids, centroids, cz, cn,
+                eps_gamma=outer_gamma_eps, num_iter=num_iter,
+            )
+            T_qneg = _apply_outer_gamma(T_qneg, labels_z, beta_n, off_n)
+
         V = T_pq - T_qneg
         if labels_u_ is not None:
             T_quncond = _per_cluster_bary(
@@ -705,6 +807,13 @@ def _compute_V_clustered(
                 eps=eps, num_iter=num_iter,
                 use_quadratic_cost=use_quadratic_cost,
             )
+            if use_outer_gamma:
+                cu = _cluster_marginals(labels_u_, n_clusters).to(z.dtype)
+                beta_u, off_u = _outer_gamma_targets(
+                    centroids, centroids, cz, cu,
+                    eps_gamma=outer_gamma_eps, num_iter=num_iter,
+                )
+                T_quncond = _apply_outer_gamma(T_quncond, labels_z, beta_u, off_u)
             V = V + cfg_weight.view(-1, 1, 1) * (T_pq - T_quncond)
         return V
 
@@ -755,6 +864,8 @@ def drift_loss_ot(
     mask_lambda: float = 1.0,
     cluster_centroids: torch.Tensor | None = None,
     use_per_cluster_sinkhorn: bool = True,
+    use_outer_gamma: bool = False,
+    outer_gamma_eps: float = 0.1,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Debiased entropic-OT drifting loss.
 
@@ -874,6 +985,8 @@ def drift_loss_ot(
                         if cluster_centroids is not None else None
                     ),
                     use_per_cluster_sinkhorn=use_per_cluster_sinkhorn,
+                    use_outer_gamma=use_outer_gamma,
+                    outer_gamma_eps=outer_gamma_eps,
                 )
                 f_norm = (V_raw ** 2).mean()
                 info[f"loss_{R}"] = f_norm
