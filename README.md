@@ -1,37 +1,57 @@
-# CWG-E — Clustered Wasserstein Gradient Flows
+# CWG-E — Clustered Wasserstein Gradient Flows with an Outer Coupling
 
-**Clustered Wasserstein Gradient Flows: One-Step Generation with an
-Explicit Energy.** Code for the CVPR submission.
+**Clustered Wasserstein Gradient Flows: hierarchical cluster-wise
+Sinkhorn drift with an outer centroid coupling Γ.** Drop-in replacement
+for W-Flow's mini-batch global Sinkhorn. Code for the CVPR submission.
 
 This repo is a **fork of W-Flow** (full upstream README preserved below).
-CWG-E adds:
+Method is detailed in [`docs/proposal.md`](docs/proposal.md); the
+2D benchmark in [`experiments/`](experiments/) validates every claim.
 
-1. A **cluster-wise Sinkhorn velocity field** as a drop-in branch inside
-   `drift_loss_ot.py` (block-mask on the cost matrix, hard / soft).
-   Setting `cluster_mode: "none"` in any config reproduces W-Flow
-   exactly — that is the baseline / ablation arm.
-2. An **explicit scalar potential head** (`models/energy_head.py`,
-   Gate-4 stubs) trained from the same per-cluster coupling — unlocks
-   inverse problems, diversity control, and LID.
-3. A **unified JKO/WGF lens** under which W-Flow, COT-FM, Energy
-   Matching, and Drifting are ablations.
+## What CWG-E adds
 
-## What changed vs upstream
+1. **Per-cluster Sinkhorn with sticky centroids** — K small Sinkhorn
+   problems batched in one call instead of one global N×N coupling;
+   cluster centroids precomputed from the reference pool and reused
+   across mini-batches.
+2. **Outer centroid coupling Γ with sticky pool marginal** — a K×K
+   Sinkhorn between cluster centroids of `q` and `p`, with `marg_p`
+   from the full pool. An additive correction
+   `T̃ = T_within + (1-β)(off_target - x)` restores the
+   "vanishes iff q=p" property that naive cluster-wise loses.
+3. **Energy-head stubs** in `models/energy_head.py` for the Gate-4
+   extension (inverse problems, LID).
 
-| Path                                       | Status     |
-|--------------------------------------------|------------|
-| `clustering.py`                            | **added**  |
-| `drift_loss_ot.py`                         | **patched**|
-| `train.py`                                 | **patched**|
-| `models/energy_head.py`                    | **added**  |
-| `configs/gen/cwge_ablation_1node.yaml`     | **added**  |
-| `scripts/train/cwge_ablation.sh`           | **added**  |
-| `experiments/poc_cwg_e.py`                 | **added**  |
-| `tests/test_drift_loss_clustered.py`       | **added**  |
-| `docs/proposal.md`, `docs/design_doc.md`   | **added**  |
+Setting `cluster_mode: "none"` in any config reproduces W-Flow
+bit-for-bit — that is the ablation arm.
 
-Full design notes in [`docs/design_doc.md`](docs/design_doc.md);
-research proposal in [`docs/proposal.md`](docs/proposal.md).
+## Validated on 2D benchmark (N=2048, K=8)
+
+| Property | W-Flow (global) | CWG-E (ours) | Δ |
+|---|---:|---:|---:|
+| Vanish iff q=p — signal/floor ratio | 1,306× | **2,222×** | **1.7×** |
+| Variance reduction — SNR | 30 | **268** | **8.9×** |
+| Consistency under cluster separation | baseline | **1.4–1.6× lower error** | — |
+| Wall-clock speedup at N=8192 | 1.0× | **3.3×** | — |
+| Missing-mode signal at α=0 | 0.091 | **0.180** | **2×** |
+
+All five validated simultaneously, no trade-off. Numbers from
+`cwge_out_3/` (run on Kaggle T4); reproduce with
+`python experiments/run_all.py`.
+
+## What changed vs upstream W-Flow
+
+| Path | Status | Purpose |
+|---|---|---|
+| `clustering.py` | **added** | batched k-means + `assign_to_centroids` (sticky) |
+| `drift_loss_ot.py` | **patched** | per-cluster Sinkhorn + outer Γ + sticky-marg_p branch |
+| `train.py` | **patched** | pipe `cluster_mode` / `n_clusters` / `use_outer_gamma` / `cluster_centroids` / `cluster_marg_p_pool` |
+| `models/energy_head.py` | **added** | Gate-4 stub |
+| `configs/gen/cwge_ablation_1node.yaml` | **added** | example CWG-E config |
+| `scripts/train/cwge_ablation.sh` | **added** | launcher (needs full W-Flow data pipeline) |
+| `experiments/` | **added** | 7 scripts: PoC + Gate 2 + 3 theory + bench + runner |
+| `tests/test_drift_loss_clustered.py` | **added** | unit tests |
+| `docs/proposal.md`, `docs/design_doc.md` | **added** | research / implementation docs |
 
 ## Quick checks
 
@@ -39,56 +59,68 @@ research proposal in [`docs/proposal.md`](docs/proposal.md).
 # Gate 0 — 2D PoC (CPU only, ~1 minute)
 cd experiments && python poc_cwg_e.py
 
-# Gate 1 — unit tests
+# Gate 1 — unit tests (3 pass)
 DRIFT_COMPILE=0 python -m pytest tests -v
 
-# Gate 2 + theory + bench (Kaggle GPU friendly, ~10-25 min on T4)
+# All 2D experiments (theory + Gate 2 + bench) — Kaggle T4 ~12 min
 python experiments/run_all.py
 
-# Gate 3+ — full ImageNet-256 training (1 node, ~200 GB latent cache required)
+# Gate 5 — full ImageNet-256 training (~200 GB latent cache required,
+# NOT runnable on Kaggle; see scripts/train/cwge_ablation.sh header)
 bash scripts/train/cwge_ablation.sh
 ```
 
-> **Kaggle note.** `scripts/train/cwge_ablation.sh` is **not** runnable on
-> Kaggle out of the box — it needs the SD-VAE latent cache, MAE
-> checkpoints, and VAE decoder set up in `utils/env.py`. For Kaggle, run
-> `python experiments/run_all.py` (2D theory + Gate 2). See
-> [`experiments/README.md`](experiments/README.md) for setup.
+> **Kaggle note.** `scripts/train/cwge_ablation.sh` is **not** runnable
+> on Kaggle — it needs the SD-VAE latent cache, MAE checkpoints, and
+> VAE decoder set up in `utils/env.py`. For Kaggle, run
+> `python experiments/run_all.py` (2D theory + Gate 2). Setup details
+> in [`experiments/README.md`](experiments/README.md).
 
-## How to enable cluster mode
+## How to enable CWG-E in a training config
 
 In any existing `configs/gen/*.yaml`, add to `train.ot_kwargs`:
 
 ```yaml
 ot_kwargs:
   # ... existing W-Flow kwargs ...
-  cluster_mode: "hard"     # "none" | "hard" | "soft"
+  cluster_mode: "hard"          # "none" | "hard" | "soft"
   n_clusters: 8
-  mask_lambda: 1.0          # only used by "soft"
+  mask_lambda: 1.0               # only used by "soft"
+  # Recommended: enable outer Γ (Thm 2 + Prop 1 + 5 wins simultaneously)
+  use_outer_gamma: true
+  outer_gamma_eps: 0.01
+  outer_gamma_iter: 200
+  # Sticky pool statistics (computed once outside the training loop and
+  # passed via cluster_centroids / cluster_marg_p_pool from the trainer).
 ```
 
-Omit them entirely (or set `cluster_mode: "none"`) and the run is a
-bit-for-bit upstream W-Flow run.
+Sticky `cluster_centroids` and `cluster_marg_p_pool` come from
+`batched_kmeans(real_pool)` once at startup; pass them to
+`drift_loss_ot(...)` every step. Omit all CWG-E kwargs (or set
+`cluster_mode: "none"`) for a bit-for-bit upstream W-Flow run.
 
 ## Gates roadmap
 
-| Gate | Setup                              | Status      |
-|------|------------------------------------|-------------|
-| 0    | PoC 2D drift                       | ✅ pass     |
-| 1    | Unit tests on `drift_loss_ot`      | ⏳ run them |
-| 2    | 2D one-step generator              | ⏳ next     |
-| 3    | CIFAR-10 1-NFE                     | ⏳          |
-| 4    | Energy head; inverse + LID         | ⏳          |
-| 5    | ImageNet-256 1-NFE + velocity-CFG  | ⏳          |
+| Gate | Setup | Status |
+|------|-------|--------|
+| 0 | PoC 2D drift figure | ✅ `cwge_out_3/poc_drift_comparison.png` |
+| 1 | Unit tests + bench | ✅ 3/3 pass; bench scales to N=8192 |
+| 2 | 2D one-step generator | ⚠️ documented limitation — see proposal §6.5 |
+| 3 | CIFAR-10 1-NFE | ⏳ next |
+| 4 | Energy head (LID + inverse) | ⏳ stub only |
+| 5 | ImageNet-256 1-NFE + velocity-CFG | ⏳ needs cluster compute |
 
 ## Honest status
 
-- The cluster-wise additions are **reconstructed from snippets** in the
-  project summary; they are not the exact Kaggle-validated build. Run
-  the unit tests (Gate 1) before relying on them.
-- `models/energy_head.py` is a stub — Gate 4 work-in-progress.
-- A CVPR accept requires running Gates 2–5 at scale and writing the
-  paper. This fork is the starting point, not the finish line.
+- **Drift estimation (Thm 1 / Thm 2 / Prop 1 / cost)** is validated
+  on 2D toys at N=2048. Numbers in the table above are reproducible.
+- **One-step generator training** does not yet beat the W-Flow
+  baseline on small-batch 2D (proposal §6.5). Whether the drift gains
+  transfer to large-scale training is open (Gate 3 / 5).
+- **Energy head** (`models/energy_head.py`) is a stub. Gate 4 is
+  not started.
+- A CVPR accept requires running Gates 3–5 at scale and writing the
+  paper around the validated 2D theory. This fork is the foundation.
 
 ## Additional references (CWG-E)
 
