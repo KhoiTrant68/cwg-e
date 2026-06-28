@@ -742,7 +742,8 @@ def _compute_V_clustered(
     cluster_centroids: torch.Tensor | None = None,
     use_per_cluster_sinkhorn: bool = True,
     use_outer_gamma: bool = False,
-    outer_gamma_eps: float = 0.1,
+    outer_gamma_eps: float = 0.01,
+    outer_gamma_iter: int = 200,
 ) -> torch.Tensor:
     """Cluster-wise debiased OT velocity V = T_pq - T_qneg (+ optional CFG).
 
@@ -804,12 +805,12 @@ def _compute_V_clustered(
             cn = _cluster_marginals(labels_n, n_clusters).to(z.dtype)
             beta_p, off_p = _outer_gamma_targets(
                 centroids, centroids, cz, cp,
-                eps_gamma=outer_gamma_eps, num_iter=num_iter,
+                eps_gamma=outer_gamma_eps, num_iter=outer_gamma_iter,
             )
             T_pq = _apply_outer_gamma(T_pq, labels_z, beta_p, off_p, z=z)
             beta_n, off_n = _outer_gamma_targets(
                 centroids, centroids, cz, cn,
-                eps_gamma=outer_gamma_eps, num_iter=num_iter,
+                eps_gamma=outer_gamma_eps, num_iter=outer_gamma_iter,
             )
             T_qneg = _apply_outer_gamma(T_qneg, labels_z, beta_n, off_n, z=z)
 
@@ -824,7 +825,7 @@ def _compute_V_clustered(
                 cu = _cluster_marginals(labels_u_, n_clusters).to(z.dtype)
                 beta_u, off_u = _outer_gamma_targets(
                     centroids, centroids, cz, cu,
-                    eps_gamma=outer_gamma_eps, num_iter=num_iter,
+                    eps_gamma=outer_gamma_eps, num_iter=outer_gamma_iter,
                 )
                 T_quncond = _apply_outer_gamma(T_quncond, labels_z, beta_u, off_u, z=z)
             V = V + cfg_weight.view(-1, 1, 1) * (T_pq - T_quncond)
@@ -878,7 +879,8 @@ def drift_loss_ot(
     cluster_centroids: torch.Tensor | None = None,
     use_per_cluster_sinkhorn: bool = True,
     use_outer_gamma: bool = False,
-    outer_gamma_eps: float = 0.1,
+    outer_gamma_eps: float = 0.01,
+    outer_gamma_iter: int = 200,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Debiased entropic-OT drifting loss.
 
@@ -1000,6 +1002,7 @@ def drift_loss_ot(
                     use_per_cluster_sinkhorn=use_per_cluster_sinkhorn,
                     use_outer_gamma=use_outer_gamma,
                     outer_gamma_eps=outer_gamma_eps,
+                    outer_gamma_iter=outer_gamma_iter,
                 )
                 f_norm = (V_raw ** 2).mean()
                 info[f"loss_{R}"] = f_norm

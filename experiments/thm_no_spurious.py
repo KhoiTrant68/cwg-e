@@ -63,7 +63,7 @@ def _V_cluster(q: torch.Tensor, p: torch.Tensor, K: int,
                centroids: torch.Tensor | None = None,
                use_per_cluster: bool = True,
                use_outer_gamma: bool = False,
-               outer_gamma_eps: float = 0.1) -> torch.Tensor:
+               outer_gamma_eps: float = 0.01) -> torch.Tensor:
     eps = torch.tensor(0.05 * (q.shape[-1] ** 0.5), device=q.device)
     return _compute_V_clustered(
         q[None], p[None], q[None].detach(),
@@ -130,7 +130,7 @@ def main():
                            centroids=cents_K,
                            use_per_cluster=True,
                            use_outer_gamma=True,
-                           outer_gamma_eps=0.1
+                           outer_gamma_eps=0.01,   # sharp Γ → β→1 at q=p
                            ).pow(2).sum(-1).mean().item())
             vals["meanshift"].append(_V_meanshift(q_t, p_t).pow(2).sum(-1).mean().item())
         for name in series:
