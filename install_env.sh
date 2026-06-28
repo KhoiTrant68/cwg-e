@@ -12,4 +12,4 @@ pip install torch-fidelity
 
 pip install wheel
 pip install psutil
-pip install flash-attn==2.6.3 --no-build-isolation
+# pip install flash-attn==2.6.3 --no-build-isolation
