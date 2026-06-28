@@ -31,8 +31,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from _common import device, out_dir, sample_ring8
-from drift_loss_ot import drift_loss_ot, _compute_V_clustered  # noqa: E402
-from clustering import batched_kmeans  # noqa: E402
+from drift_loss_ot import drift_loss_ot, _compute_V_clustered, _cluster_marginals  # noqa: E402
+from clustering import batched_kmeans, assign_to_centroids  # noqa: E402
 
 
 def _q_alpha(alpha: float, n: int, seed: int) -> np.ndarray:
@@ -63,7 +63,8 @@ def _V_cluster(q: torch.Tensor, p: torch.Tensor, K: int,
                centroids: torch.Tensor | None = None,
                use_per_cluster: bool = True,
                use_outer_gamma: bool = False,
-               outer_gamma_eps: float = 0.01) -> torch.Tensor:
+               outer_gamma_eps: float = 0.01,
+               marg_p_pool: torch.Tensor | None = None) -> torch.Tensor:
     eps = torch.tensor(0.05 * (q.shape[-1] ** 0.5), device=q.device)
     return _compute_V_clustered(
         q[None], p[None], q[None].detach(),
@@ -74,6 +75,7 @@ def _V_cluster(q: torch.Tensor, p: torch.Tensor, K: int,
         use_per_cluster_sinkhorn=use_per_cluster,
         use_outer_gamma=use_outer_gamma,
         outer_gamma_eps=outer_gamma_eps,
+        cluster_marg_p_pool=marg_p_pool,
     )[0]
 
 
@@ -106,6 +108,8 @@ def main():
     # Sticky centroids from the full p
     _, cents = batched_kmeans(p_t.unsqueeze(0), K=args.n_clusters, num_iter=30)
     cents_K = cents.squeeze(0)
+    labels_pool = assign_to_centroids(p_t.unsqueeze(0), cents)
+    marg_p_pool = _cluster_marginals(labels_pool, args.n_clusters).squeeze(0)
 
     rows = []
     series = {name: np.zeros(len(alphas)) for name in
@@ -133,6 +137,7 @@ def main():
                            use_per_cluster=True,
                            use_outer_gamma=True,
                            outer_gamma_eps=0.01,   # sharp Γ → β→1 at q=p
+                           marg_p_pool=marg_p_pool,
                            ).pow(2).sum(-1).mean().item())
             vals["meanshift"].append(_V_meanshift(q_t, p_t).pow(2).sum(-1).mean().item())
         for name in series:

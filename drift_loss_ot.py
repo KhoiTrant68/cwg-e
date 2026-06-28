@@ -744,6 +744,7 @@ def _compute_V_clustered(
     use_outer_gamma: bool = False,
     outer_gamma_eps: float = 0.01,
     outer_gamma_iter: int = 200,
+    cluster_marg_p_pool: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Cluster-wise debiased OT velocity V = T_pq - T_qneg (+ optional CFG).
 
@@ -801,8 +802,16 @@ def _compute_V_clustered(
         # whose marginal is non-zero, even when one side is empty.
         if use_outer_gamma:
             cz = _cluster_marginals(labels_z, n_clusters).to(z.dtype)
-            cp = _cluster_marginals(labels_p, n_clusters).to(z.dtype)
             cn = _cluster_marginals(labels_n, n_clusters).to(z.dtype)
+            # Sticky marg_p from pool removes mini-batch noise in Γ → preserves
+            # the variance win (Prop 1). marg_q still varies per call so the
+            # missing-mode signal for Thm 2 is unaffected.
+            if cluster_marg_p_pool is not None:
+                cp = cluster_marg_p_pool.to(z)
+                if cp.dim() == 1:
+                    cp = cp.unsqueeze(0).expand(z.shape[0], -1)
+            else:
+                cp = _cluster_marginals(labels_p, n_clusters).to(z.dtype)
             beta_p, off_p = _outer_gamma_targets(
                 centroids, centroids, cz, cp,
                 eps_gamma=outer_gamma_eps, num_iter=outer_gamma_iter,
@@ -881,6 +890,7 @@ def drift_loss_ot(
     use_outer_gamma: bool = False,
     outer_gamma_eps: float = 0.01,
     outer_gamma_iter: int = 200,
+    cluster_marg_p_pool: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Debiased entropic-OT drifting loss.
 
@@ -1003,6 +1013,7 @@ def drift_loss_ot(
                     use_outer_gamma=use_outer_gamma,
                     outer_gamma_eps=outer_gamma_eps,
                     outer_gamma_iter=outer_gamma_iter,
+                    cluster_marg_p_pool=cluster_marg_p_pool,
                 )
                 f_norm = (V_raw ** 2).mean()
                 info[f"loss_{R}"] = f_norm

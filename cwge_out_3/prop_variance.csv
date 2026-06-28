@@ -1,4 +1,5 @@
-mode,K,mask_lambda,variance,signal_norm,snr
-none,1,0.0,0.053401,1.609525,30.14
-hard,8,0.0,0.009773,2.061547,210.943
-soft,8,1.0,0.007848,2.078668,264.882
+mode,K,mask_lambda,use_outer_gamma,variance,signal_norm,snr
+none,1,0.0,False,0.053401,1.609525,30.14
+hard,8,0.0,False,0.009773,2.061547,210.943
+soft,8,1.0,False,0.007848,2.078668,264.882
+hard_outerG,8,0.0,True,0.050247,2.663269,53.004

@@ -25,14 +25,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from _common import device, out_dir, sample_ring8
-from drift_loss_ot import _compute_V_clustered  # noqa: E402
-from clustering import batched_kmeans  # noqa: E402
+from drift_loss_ot import _compute_V_clustered, _cluster_marginals  # noqa: E402
+from clustering import batched_kmeans, assign_to_centroids  # noqa: E402
 
 
 def _V(q: torch.Tensor, p: torch.Tensor, cluster_mode: str, K: int,
        mask_lambda: float,
        centroids: torch.Tensor | None = None,
-       use_outer_gamma: bool = False) -> torch.Tensor:
+       use_outer_gamma: bool = False,
+       marg_p_pool: torch.Tensor | None = None) -> torch.Tensor:
     eps = torch.tensor(0.05 * (q.shape[-1] ** 0.5), device=q.device)
     return _compute_V_clustered(
         q[None], p[None], q[None].detach(),
@@ -45,6 +46,7 @@ def _V(q: torch.Tensor, p: torch.Tensor, cluster_mode: str, K: int,
         use_per_cluster_sinkhorn=True,
         use_outer_gamma=use_outer_gamma,
         outer_gamma_eps=0.01,
+        cluster_marg_p_pool=marg_p_pool,
     )[0]
 
 
@@ -83,6 +85,11 @@ def main():
     )                                                # [1, K, D]
     centroids_fixed = centroids_pool.squeeze(0)      # [K, D]
 
+    # Pool-level cluster marginal for p — used by outer Γ so it doesn't
+    # absorb mini-batch noise (which would erase the variance win).
+    labels_pool = assign_to_centroids(p_pool.unsqueeze(0), centroids_pool)
+    marg_p_pool = _cluster_marginals(labels_pool, args.n_clusters).squeeze(0)  # [K]
+
     # Last tuple element: use_outer_gamma flag
     modes = [
         ("none",         1,                0.0, False),
@@ -98,8 +105,9 @@ def main():
         for mode, K, lam, og in modes:
             cents = None if mode == "none" else centroids_fixed
             inner_mode = "hard" if mode in ("hard", "hard_outerG") else mode
+            mpool = marg_p_pool if og else None
             V = _V(q, p_batch, inner_mode, K, lam, centroids=cents,
-                   use_outer_gamma=og)
+                   use_outer_gamma=og, marg_p_pool=mpool)
             stacks[mode].append(V)
 
     rows = []
