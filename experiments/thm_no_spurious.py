@@ -87,7 +87,9 @@ def _V_meanshift(q: torch.Tensor, p: torch.Tensor, sigma: float = 0.2) -> torch.
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n", type=int, default=512)
+    parser.add_argument("--n", type=int, default=2048,
+                        help="larger N reduces outer-Γ finite-sample residual at q=p; "
+                             "residual ∝ 1/N, so 2048 gives ~4x better vanishing than 512")
     parser.add_argument("--n-alphas", type=int, default=11)
     parser.add_argument("--n-clusters", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=5, help="seeds per alpha")
@@ -168,7 +170,7 @@ def main():
     ax.set_yscale("log")
     ax.set_xlabel("α   (q = p at α = 1; mode 0 missing at α = 0)")
     ax.set_ylabel(r"mean  $\|V(x)\|^2$  (log)")
-    ax.set_title("Thm 2: outer Γ restores vanish-at-q=p for per-cluster CWG-E")
+    ax.set_title(f"Thm 2: outer Γ recovers a signal/floor ratio across α  (N={args.n})")
     ax.annotate(
         "per-cluster flat → spurious eq.",
         xy=(0.1, series["cluster_per"][1]),
@@ -176,8 +178,9 @@ def main():
         arrowprops=dict(arrowstyle="->", color="#7A55C9", lw=1.0),
         color="#7A55C9", fontsize=8,
     )
+    ratio_outerG = series["cluster_per_outerG"][0] / max(series["cluster_per_outerG"][-1], 1e-12)
     ax.annotate(
-        "+ outer Γ: drops monotonically",
+        f"+ outer Γ: spread α=0→1 ≈ {ratio_outerG:.0f}×\n(residual at q=p shrinks as O(1/N))",
         xy=(0.05, series["cluster_per_outerG"][0]),
         xytext=(0.25, max(series["cluster_per_outerG"][0] * 1.6, 3e-2)),
         arrowprops=dict(arrowstyle="->", color="#0F6E56", lw=1.0),
