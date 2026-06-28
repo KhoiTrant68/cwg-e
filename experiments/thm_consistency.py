@@ -45,7 +45,8 @@ def _make_clusters(n: int, K: int, sep: float, std: float, seed: int) -> np.ndar
 
 
 def _V(q: torch.Tensor, p: torch.Tensor, cluster_mode: str, K: int,
-       centroids: torch.Tensor | None = None) -> torch.Tensor:
+       centroids: torch.Tensor | None = None,
+       use_outer_gamma: bool = False) -> torch.Tensor:
     eps = torch.tensor(0.05 * (q.shape[-1] ** 0.5), device=q.device)
     return _compute_V_clustered(
         q[None], p[None], q[None].detach(),
@@ -56,13 +57,16 @@ def _V(q: torch.Tensor, p: torch.Tensor, cluster_mode: str, K: int,
         num_iter=30,
         cluster_centroids=centroids,
         use_per_cluster_sinkhorn=True,
+        use_outer_gamma=use_outer_gamma,
+        outer_gamma_eps=0.01,
     )[0]
 
 
 def _ideal_V_at(q_small: torch.Tensor, p_big: torch.Tensor, K: int,
                 centroids: torch.Tensor | None) -> torch.Tensor:
     """Compute V at the same q points using a large p reference (low-variance)."""
-    return _V(q_small, p_big, "hard", K, centroids=centroids)
+    return _V(q_small, p_big, "hard", K, centroids=centroids,
+              use_outer_gamma=True)
 
 
 def main():
@@ -86,11 +90,13 @@ def main():
     rows = []
     err_none = np.zeros(len(args.seps))
     err_hard = np.zeros(len(args.seps))
+    err_outerG = np.zeros(len(args.seps))
     sd_none = np.zeros(len(args.seps))
     sd_hard = np.zeros(len(args.seps))
+    sd_outerG = np.zeros(len(args.seps))
 
     for i, s in enumerate(args.seps):
-        en, eh = [], []
+        en, eh, eo = [], [], []
         for r in range(args.repeats):
             p_big = torch.as_tensor(
                 _make_clusters(args.n_big, args.K, s, args.intra_std, seed=100 + r),
@@ -113,23 +119,30 @@ def main():
             V_ideal = _ideal_V_at(q_small, p_big, args.K, centroids=cents_K)
             V_none = _V(q_small, p_small, "none", args.K, centroids=None)
             V_hard = _V(q_small, p_small, "hard", args.K, centroids=cents_K)
+            V_outerG = _V(q_small, p_small, "hard", args.K, centroids=cents_K,
+                          use_outer_gamma=True)
 
             en.append((V_none - V_ideal).pow(2).sum(-1).mean().item())
             eh.append((V_hard - V_ideal).pow(2).sum(-1).mean().item())
+            eo.append((V_outerG - V_ideal).pow(2).sum(-1).mean().item())
 
         err_none[i] = float(np.mean(en)); sd_none[i] = float(np.std(en))
         err_hard[i] = float(np.mean(eh)); sd_hard[i] = float(np.std(eh))
+        err_outerG[i] = float(np.mean(eo)); sd_outerG[i] = float(np.std(eo))
         rows.append(dict(sep=s,
                          err_none=round(err_none[i], 6),
-                         err_hard=round(err_hard[i], 6)))
+                         err_hard=round(err_hard[i], 6),
+                         err_outerG=round(err_outerG[i], 6)))
         print(f"[thm_consistency] sep={s:.1f}  none={err_none[i]:.4f}  "
-              f"hard={err_hard[i]:.4f}")
+              f"hard={err_hard[i]:.4f}  outerG={err_outerG[i]:.4f}")
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     ax.errorbar(args.seps, err_none, yerr=sd_none, label="Global Sinkhorn (none)",
                 color="#185FA5", marker="o", capsize=3)
-    ax.errorbar(args.seps, err_hard, yerr=sd_hard, label=f"Cluster-wise hard (K={args.K})",
+    ax.errorbar(args.seps, err_hard, yerr=sd_hard, label=f"CWG-E hard (K={args.K})",
                 color="#0F6E56", marker="o", capsize=3)
+    ax.errorbar(args.seps, err_outerG, yerr=sd_outerG, label=f"CWG-E hard + outer Γ (K={args.K})",
+                color="#7A55C9", marker="D", capsize=3)
     ax.set_xlabel("Inter-cluster separation s")
     ax.set_ylabel(r"$\|\hat V - V_\ast\|^2$")
     ax.set_yscale("log")

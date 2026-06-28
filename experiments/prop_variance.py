@@ -31,7 +31,8 @@ from clustering import batched_kmeans  # noqa: E402
 
 def _V(q: torch.Tensor, p: torch.Tensor, cluster_mode: str, K: int,
        mask_lambda: float,
-       centroids: torch.Tensor | None = None) -> torch.Tensor:
+       centroids: torch.Tensor | None = None,
+       use_outer_gamma: bool = False) -> torch.Tensor:
     eps = torch.tensor(0.05 * (q.shape[-1] ** 0.5), device=q.device)
     return _compute_V_clustered(
         q[None], p[None], q[None].detach(),
@@ -42,6 +43,8 @@ def _V(q: torch.Tensor, p: torch.Tensor, cluster_mode: str, K: int,
         num_iter=30,
         cluster_centroids=centroids,
         use_per_cluster_sinkhorn=True,
+        use_outer_gamma=use_outer_gamma,
+        outer_gamma_eps=0.01,
     )[0]
 
 
@@ -80,38 +83,47 @@ def main():
     )                                                # [1, K, D]
     centroids_fixed = centroids_pool.squeeze(0)      # [K, D]
 
-    modes = [("none", 1, 0.0), ("hard", args.n_clusters, 0.0),
-             ("soft", args.n_clusters, 1.0)]
+    # Last tuple element: use_outer_gamma flag
+    modes = [
+        ("none",         1,                0.0, False),
+        ("hard",         args.n_clusters,  0.0, False),
+        ("soft",         args.n_clusters,  1.0, False),
+        ("hard_outerG",  args.n_clusters,  0.0, True),
+    ]
     stacks: dict[str, list[torch.Tensor]] = {m[0]: [] for m in modes}
 
     for d in range(args.n_draws):
         idx = torch.randint(0, args.pool, (args.n,), device=dev)
         p_batch = p_pool[idx]
-        for mode, K, lam in modes:
+        for mode, K, lam, og in modes:
             cents = None if mode == "none" else centroids_fixed
-            V = _V(q, p_batch, mode, K, lam, centroids=cents)
+            inner_mode = "hard" if mode in ("hard", "hard_outerG") else mode
+            V = _V(q, p_batch, inner_mode, K, lam, centroids=cents,
+                   use_outer_gamma=og)
             stacks[mode].append(V)
 
     rows = []
-    fig, ax = plt.subplots(figsize=(6, 4.5))
+    fig, ax = plt.subplots(figsize=(7, 4.5))
     bar_x = np.arange(len(modes))
     bar_h, bar_e = [], []
 
-    for mode, K, lam in modes:
+    for mode, K, lam, og in modes:
         Vs = torch.stack(stacks[mode], dim=0)
         var = _variance(Vs)
         norm = Vs.mean(dim=0).pow(2).sum(-1).mean().item()
         snr = norm / max(var, 1e-12)
         rows.append(dict(mode=mode, K=K, mask_lambda=lam,
+                         use_outer_gamma=og,
                          variance=round(var, 6),
                          signal_norm=round(norm, 6),
                          snr=round(snr, 3)))
         bar_h.append(var)
         bar_e.append(0.0)
-        print(f"[prop_variance] mode={mode:5s}  var={var:.5f}  "
+        print(f"[prop_variance] mode={mode:12s}  var={var:.5f}  "
               f"signal={norm:.5f}  SNR={snr:.2f}")
 
-    colors = {"none": "#185FA5", "hard": "#0F6E56", "soft": "#D85A30"}
+    colors = {"none": "#185FA5", "hard": "#0F6E56",
+              "soft": "#D85A30", "hard_outerG": "#7A55C9"}
     ax.bar(bar_x, bar_h, color=[colors[m[0]] for m in modes])
     ax.set_xticks(bar_x)
     ax.set_xticklabels([m[0] for m in modes])
