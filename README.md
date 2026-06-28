@@ -42,9 +42,18 @@ cd experiments && python poc_cwg_e.py
 # Gate 1 — unit tests
 DRIFT_COMPILE=0 python -m pytest tests -v
 
-# Gate 3+ — train CWG-E ablation (1 node)
+# Gate 2 + theory + bench (Kaggle GPU friendly, ~10-25 min on T4)
+python experiments/run_all.py
+
+# Gate 3+ — full ImageNet-256 training (1 node, ~200 GB latent cache required)
 bash scripts/train/cwge_ablation.sh
 ```
+
+> **Kaggle note.** `scripts/train/cwge_ablation.sh` is **not** runnable on
+> Kaggle out of the box — it needs the SD-VAE latent cache, MAE
+> checkpoints, and VAE decoder set up in `utils/env.py`. For Kaggle, run
+> `python experiments/run_all.py` (2D theory + Gate 2). See
+> [`experiments/README.md`](experiments/README.md) for setup.
 
 ## How to enable cluster mode
 

@@ -63,29 +63,33 @@ def test_off_block_leak_is_zero_in_hard_mode():
     assert leaked == 0.0, f"hard mode leaked {leaked:.3e} / {total:.3e} off-block"
 
 
-def test_cluster_mode_improves_own_cluster_targeting():
+def test_cluster_mode_pulls_source_toward_target():
+    """V from a spread-out source toward a 3-cluster target should reduce
+    average nearest-target distance. Previous version of this test was
+    buggy: it passed the same tensor as ``fixed_pos`` and ``fixed_neg``,
+    which forces V = T_{q,p} - T_{q,neg} to cancel to zero by construction.
+    """
     torch.manual_seed(0)
-    X, _ = _make_three_clusters(B=1, n_per=60)
-    Y = X + 0.05 * torch.randn_like(X)
+    target, _ = _make_three_clusters(B=1, n_per=60)
+    # Source: spread random points, NOT on the clusters
+    source = torch.randn_like(target) * 1.5
 
     eps = torch.tensor(0.5)
-
     V_hard = _compute_V_clustered(
-        X, Y, Y, eps=eps,
+        source, target, source.detach(),
+        eps=eps,
         cluster_mode="hard", n_clusters=3, mask_lambda=0.0,
         num_iter=50,
     )
 
-    labels, centroids = batched_kmeans(X, K=3, num_iter=10)
-    own_means = centroids.gather(1, labels[:, :, None].expand(-1, -1, X.shape[-1]))
+    def avg_nn_dist(a, b):
+        return torch.cdist(a.squeeze(0), b.squeeze(0)).min(dim=1).values.mean()
 
-    err_hard = (X + V_hard - own_means).pow(2).sum(-1).sqrt().mean()
-    # Baseline: zero velocity (i.e., X stays where it is).
-    err_none = (X - own_means).pow(2).sum(-1).sqrt().mean()
-
-    assert err_hard < err_none, (
-        f"cluster mode should move particles toward their own cluster mean: "
-        f"none={err_none.item():.3f} hard={err_hard.item():.3f}"
+    d_before = avg_nn_dist(source, target)
+    d_after = avg_nn_dist(source + V_hard, target)
+    assert d_after < d_before, (
+        f"V_hard should move source toward target: "
+        f"before={d_before.item():.3f} after={d_after.item():.3f}"
     )
 
 
@@ -111,7 +115,7 @@ def test_public_api_runs_in_all_modes():
 if __name__ == "__main__":
     test_off_block_leak_is_zero_in_hard_mode()
     print("[PASS] off-block leak = 0 in hard mode")
-    test_cluster_mode_improves_own_cluster_targeting()
-    print("[PASS] cluster mode improves own-cluster targeting")
+    test_cluster_mode_pulls_source_toward_target()
+    print("[PASS] cluster mode pulls source toward target")
     test_public_api_runs_in_all_modes()
     print("[PASS] public API runs in {none, hard, soft}")
