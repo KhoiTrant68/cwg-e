@@ -5,3 +5,5 @@ wandb/
 __pycache__/
 *.pyc
 .DS_Store
+cwge_out/
+out/

@@ -23,10 +23,12 @@ import matplotlib.pyplot as plt
 
 from _common import device, out_dir, sample_ring8
 from drift_loss_ot import _compute_V_clustered  # noqa: E402
+from clustering import batched_kmeans  # noqa: E402
 
 
 def _bench_one(q: torch.Tensor, p: torch.Tensor, mode: str, K: int,
-               num_iter: int, warmup: int = 2, repeats: int = 5) -> float:
+               num_iter: int, centroids: torch.Tensor | None,
+               warmup: int = 2, repeats: int = 5) -> float:
     eps = torch.tensor(0.05 * (q.shape[-1] ** 0.5), device=q.device)
 
     def call():
@@ -37,6 +39,8 @@ def _bench_one(q: torch.Tensor, p: torch.Tensor, mode: str, K: int,
             n_clusters=1 if mode == "none" else K,
             mask_lambda=0.0,
             num_iter=num_iter,
+            cluster_centroids=centroids,         # sticky (no k-means each call)
+            use_per_cluster_sinkhorn=True,        # real K-fold speedup for hard
         )
 
     for _ in range(warmup):
@@ -73,11 +77,17 @@ def main():
                             dtype=torch.float32, device=dev)
         q = torch.randn(N, 2, device=dev) * 0.5
 
-        ms_none = _bench_one(q, p, "none", 1, args.num_iter, repeats=args.repeats)
+        # Sticky centroids: cluster p once per N, reused across the timed calls
+        cents_by_K = {K: batched_kmeans(p.unsqueeze(0), K=K, num_iter=20)[1].squeeze(0)
+                      for K in args.Ks}
+
+        ms_none = _bench_one(q, p, "none", 1, args.num_iter,
+                             centroids=None, repeats=args.repeats)
         series["none"].append(ms_none)
         row = dict(N=N, none_ms=round(ms_none, 3))
         for K in args.Ks:
-            ms_hard = _bench_one(q, p, "hard", K, args.num_iter, repeats=args.repeats)
+            ms_hard = _bench_one(q, p, "hard", K, args.num_iter,
+                                 centroids=cents_by_K[K], repeats=args.repeats)
             series[f"hard_K{K}"].append(ms_hard)
             row[f"hard_K{K}_ms"] = round(ms_hard, 3)
         rows.append(row)

@@ -33,6 +33,7 @@ from _common import (
 )
 
 from drift_loss_ot import drift_loss_ot  # noqa: E402
+from clustering import batched_kmeans  # noqa: E402
 
 
 class MLP(nn.Module):
@@ -79,6 +80,13 @@ def _train_one(
     real_pool, centres, n_dom = _sample_real(toy, n=8192, seed=seed)
     real_pool_t = torch.as_tensor(real_pool, dtype=torch.float32, device=dev)
 
+    # Pre-cluster the FIXED real pool once. Sticky centroids → consistent
+    # partition across training steps → no clustering noise driving collapse.
+    centroids_fixed = None
+    if cluster_mode != "none":
+        _, c = batched_kmeans(real_pool_t.unsqueeze(0), K=n_clusters, num_iter=30)
+        centroids_fixed = c.squeeze(0)        # [K, D]
+
     t0 = time.time()
     for step in range(steps):
         z = torch.randn(batch, 2, device=dev)
@@ -103,6 +111,8 @@ def _train_one(
             cluster_mode=cluster_mode,
             n_clusters=n_clusters,
             mask_lambda=1.0,
+            cluster_centroids=centroids_fixed,
+            use_per_cluster_sinkhorn=True,
         )
         opt.zero_grad()
         loss.mean().backward()

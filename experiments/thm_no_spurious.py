@@ -32,6 +32,7 @@ import matplotlib.pyplot as plt
 
 from _common import device, out_dir, sample_ring8
 from drift_loss_ot import drift_loss_ot, _compute_V_clustered  # noqa: E402
+from clustering import batched_kmeans  # noqa: E402
 
 
 def _q_alpha(alpha: float, n: int, seed: int) -> np.ndarray:
@@ -54,17 +55,20 @@ def _V_global(q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
         q[None], p[None], q[None].detach(),
         eps=eps,
         cluster_mode="hard", n_clusters=1, mask_lambda=0.0,
-        num_iter=30,
+        num_iter=30, use_per_cluster_sinkhorn=True,
     )[0]
 
 
-def _V_cluster(q: torch.Tensor, p: torch.Tensor, K: int) -> torch.Tensor:
+def _V_cluster(q: torch.Tensor, p: torch.Tensor, K: int,
+               centroids: torch.Tensor | None = None) -> torch.Tensor:
     eps = torch.tensor(0.05 * (q.shape[-1] ** 0.5), device=q.device)
     return _compute_V_clustered(
         q[None], p[None], q[None].detach(),
         eps=eps,
         cluster_mode="hard", n_clusters=K, mask_lambda=0.0,
         num_iter=30,
+        cluster_centroids=centroids,
+        use_per_cluster_sinkhorn=True,
     )[0]
 
 
@@ -92,6 +96,10 @@ def main():
     p_np = sample_ring8(args.n, seed=42)
     p_t = torch.as_tensor(p_np, dtype=torch.float32, device=dev)
 
+    # Sticky centroids from the full p
+    _, cents = batched_kmeans(p_t.unsqueeze(0), K=args.n_clusters, num_iter=30)
+    cents_K = cents.squeeze(0)
+
     rows = []
     series = {name: np.zeros(len(alphas)) for name in
               ("global_K1", "cluster_K", "meanshift")}
@@ -103,7 +111,8 @@ def main():
             q_np = _q_alpha(a, args.n, seed=r)
             q_t = torch.as_tensor(q_np, dtype=torch.float32, device=dev)
             vals["global_K1"].append(_V_global(q_t, p_t).pow(2).sum(-1).mean().item())
-            vals["cluster_K"].append(_V_cluster(q_t, p_t, args.n_clusters).pow(2).sum(-1).mean().item())
+            vals["cluster_K"].append(_V_cluster(q_t, p_t, args.n_clusters,
+                                                 centroids=cents_K).pow(2).sum(-1).mean().item())
             vals["meanshift"].append(_V_meanshift(q_t, p_t).pow(2).sum(-1).mean().item())
         for name in series:
             series[name][i] = float(np.mean(vals[name]))
@@ -115,22 +124,31 @@ def main():
               f"cluster={series['cluster_K'][i]:.4f}  "
               f"meanshift={series['meanshift'][i]:.4f}")
 
-    # plot
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    # plot — log y to make the "vanishes at α=1" claim visually clear
+    fig, ax = plt.subplots(figsize=(7.5, 4.7))
     labels = {
-        "global_K1": "Global Sinkhorn (W-Flow)",
-        "cluster_K": f"Cluster-wise hard (K={args.n_clusters})",
+        "global_K1": "Global Sinkhorn (W-Flow, K=1)",
+        "cluster_K": f"Cluster-wise hard (CWG-E, K={args.n_clusters})",
         "meanshift": "Heuristic mean-shift (Drifting-style)",
     }
     colors = {"global_K1": "#185FA5", "cluster_K": "#0F6E56", "meanshift": "#D85A30"}
     for name in series:
-        ax.errorbar(alphas, series[name], yerr=err[name],
+        y = np.clip(series[name], 1e-6, None)
+        ax.errorbar(alphas, y, yerr=err[name],
                     label=labels[name], color=colors[name], marker="o", capsize=3)
-    ax.set_xlabel("α  (q = p at α = 1)")
-    ax.set_ylabel(r"mean  $\|V(x)\|^2$")
-    ax.set_title("Thm 2: only principled methods vanish iff q = p")
-    ax.legend()
-    ax.grid(alpha=0.3)
+    ax.set_yscale("log")
+    ax.set_xlabel("α   (q = p at α = 1; mode 0 missing at α = 0)")
+    ax.set_ylabel(r"mean  $\|V(x)\|^2$  (log)")
+    ax.set_title("Thm 2: principled estimators vanish iff q = p; heuristic does not")
+    ax.annotate(
+        "mean-shift stays away from zero at α=1\n→ spurious equilibrium",
+        xy=(0.95, series["meanshift"][-1]),
+        xytext=(0.45, max(series["meanshift"][-1] * 5, 1e-3)),
+        arrowprops=dict(arrowstyle="->", color="#D85A30", lw=1.0),
+        color="#D85A30", fontsize=9,
+    )
+    ax.legend(loc="lower left")
+    ax.grid(alpha=0.3, which="both")
     fig_path = od / "thm_no_spurious.png"
     plt.tight_layout()
     plt.savefig(fig_path, dpi=130, bbox_inches="tight")

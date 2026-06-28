@@ -33,6 +33,7 @@ import matplotlib.pyplot as plt
 
 from _common import device, out_dir
 from drift_loss_ot import _compute_V_clustered  # noqa: E402
+from clustering import batched_kmeans  # noqa: E402
 
 
 def _make_clusters(n: int, K: int, sep: float, std: float, seed: int) -> np.ndarray:
@@ -43,7 +44,8 @@ def _make_clusters(n: int, K: int, sep: float, std: float, seed: int) -> np.ndar
     return centres[idx] + std * rng.standard_normal((n, 2))
 
 
-def _V(q: torch.Tensor, p: torch.Tensor, cluster_mode: str, K: int) -> torch.Tensor:
+def _V(q: torch.Tensor, p: torch.Tensor, cluster_mode: str, K: int,
+       centroids: torch.Tensor | None = None) -> torch.Tensor:
     eps = torch.tensor(0.05 * (q.shape[-1] ** 0.5), device=q.device)
     return _compute_V_clustered(
         q[None], p[None], q[None].detach(),
@@ -52,22 +54,28 @@ def _V(q: torch.Tensor, p: torch.Tensor, cluster_mode: str, K: int) -> torch.Ten
         n_clusters=1 if cluster_mode == "none" else K,
         mask_lambda=0.0,
         num_iter=30,
+        cluster_centroids=centroids,
+        use_per_cluster_sinkhorn=True,
     )[0]
 
 
-def _ideal_V_at(q_small: torch.Tensor, p_big: torch.Tensor, K: int) -> torch.Tensor:
+def _ideal_V_at(q_small: torch.Tensor, p_big: torch.Tensor, K: int,
+                centroids: torch.Tensor | None) -> torch.Tensor:
     """Compute V at the same q points using a large p reference (low-variance)."""
-    return _V(q_small, p_big, "hard", K)
+    return _V(q_small, p_big, "hard", K, centroids=centroids)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--K", type=int, default=4)
-    parser.add_argument("--n-small", type=int, default=128)
+    parser.add_argument("--K", type=int, default=8)
+    parser.add_argument("--n-small", type=int, default=64,
+                        help="small batch — must be small vs intra-cluster size for the bias to show")
     parser.add_argument("--n-big", type=int, default=4096)
     parser.add_argument("--seps", nargs="+", type=float,
-                        default=[1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+                        default=[0.5, 0.8, 1.2, 1.6, 2.0, 3.0])
     parser.add_argument("--repeats", type=int, default=8)
+    parser.add_argument("--intra-std", type=float, default=0.25,
+                        help="larger intra-cluster std stresses small-batch global Sinkhorn")
     args = parser.parse_args()
 
     dev = device()
@@ -85,21 +93,26 @@ def main():
         en, eh = [], []
         for r in range(args.repeats):
             p_big = torch.as_tensor(
-                _make_clusters(args.n_big, args.K, s, 0.15, seed=100 + r),
+                _make_clusters(args.n_big, args.K, s, args.intra_std, seed=100 + r),
                 dtype=torch.float32, device=dev,
             )
             q_small = torch.as_tensor(
-                _make_clusters(args.n_small, args.K, s, 0.15, seed=200 + r),
+                _make_clusters(args.n_small, args.K, s, args.intra_std, seed=200 + r),
                 dtype=torch.float32, device=dev,
             )
             p_small = torch.as_tensor(
-                _make_clusters(args.n_small, args.K, s, 0.15, seed=300 + r),
+                _make_clusters(args.n_small, args.K, s, args.intra_std, seed=300 + r),
                 dtype=torch.float32, device=dev,
             )
 
-            V_ideal = _ideal_V_at(q_small, p_big, args.K)
-            V_none = _V(q_small, p_small, "none", args.K)
-            V_hard = _V(q_small, p_small, "hard", args.K)
+            # Shared centroids from p_big — both estimators see the same partition
+            # (eliminates clustering noise as a confound; isolates the OT estimator).
+            _, cents = batched_kmeans(p_big.unsqueeze(0), K=args.K, num_iter=30)
+            cents_K = cents.squeeze(0)
+
+            V_ideal = _ideal_V_at(q_small, p_big, args.K, centroids=cents_K)
+            V_none = _V(q_small, p_small, "none", args.K, centroids=None)
+            V_hard = _V(q_small, p_small, "hard", args.K, centroids=cents_K)
 
             en.append((V_none - V_ideal).pow(2).sum(-1).mean().item())
             eh.append((V_hard - V_ideal).pow(2).sum(-1).mean().item())

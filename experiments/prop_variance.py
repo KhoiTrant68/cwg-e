@@ -26,10 +26,12 @@ import matplotlib.pyplot as plt
 
 from _common import device, out_dir, sample_ring8
 from drift_loss_ot import _compute_V_clustered  # noqa: E402
+from clustering import batched_kmeans  # noqa: E402
 
 
 def _V(q: torch.Tensor, p: torch.Tensor, cluster_mode: str, K: int,
-       mask_lambda: float) -> torch.Tensor:
+       mask_lambda: float,
+       centroids: torch.Tensor | None = None) -> torch.Tensor:
     eps = torch.tensor(0.05 * (q.shape[-1] ** 0.5), device=q.device)
     return _compute_V_clustered(
         q[None], p[None], q[None].detach(),
@@ -38,6 +40,8 @@ def _V(q: torch.Tensor, p: torch.Tensor, cluster_mode: str, K: int,
         n_clusters=1 if cluster_mode == "none" else K,
         mask_lambda=mask_lambda,
         num_iter=30,
+        cluster_centroids=centroids,
+        use_per_cluster_sinkhorn=True,
     )[0]
 
 
@@ -68,6 +72,14 @@ def main():
     p_pool = torch.as_tensor(sample_ring8(args.pool, seed=42),
                              dtype=torch.float32, device=dev)
 
+    # STICKY CENTROIDS: cluster the pool once, reuse across all mini-batch draws.
+    # This is the fix: without it, each batch re-clusters and the partition
+    # drift adds noise to V (inflating estimator variance).
+    _, centroids_pool = batched_kmeans(
+        p_pool.unsqueeze(0), K=args.n_clusters, num_iter=20,
+    )                                                # [1, K, D]
+    centroids_fixed = centroids_pool.squeeze(0)      # [K, D]
+
     modes = [("none", 1, 0.0), ("hard", args.n_clusters, 0.0),
              ("soft", args.n_clusters, 1.0)]
     stacks: dict[str, list[torch.Tensor]] = {m[0]: [] for m in modes}
@@ -76,7 +88,8 @@ def main():
         idx = torch.randint(0, args.pool, (args.n,), device=dev)
         p_batch = p_pool[idx]
         for mode, K, lam in modes:
-            V = _V(q, p_batch, mode, K, lam)
+            cents = None if mode == "none" else centroids_fixed
+            V = _V(q, p_batch, mode, K, lam, centroids=cents)
             stacks[mode].append(V)
 
     rows = []

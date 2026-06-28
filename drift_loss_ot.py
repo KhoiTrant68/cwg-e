@@ -22,7 +22,7 @@ from typing import Dict, Iterable, Tuple
 import torch
 import torch.nn.functional as F
 
-from clustering import batched_kmeans
+from clustering import batched_kmeans, assign_to_centroids, expand_centroids
 
 _COMPILE = os.environ.get("DRIFT_COMPILE", "1") != "0"
 
@@ -498,6 +498,85 @@ def _barycentric_map_clustered(
 
 
 @torch.no_grad()
+def _sinkhorn_small(
+    X: torch.Tensor,                     # [n, D]
+    Y: torch.Tensor,                     # [m, D]
+    eps: torch.Tensor,
+    num_iter: int = 50,
+    target_weights: torch.Tensor | None = None,  # [m]
+    use_quadratic_cost: bool = False,
+) -> torch.Tensor:
+    """Single-problem log-domain Sinkhorn (no batch dim). Returns Pi [n, m]."""
+    device, dtype = X.device, X.dtype
+    n, _ = X.shape
+    m = Y.shape[0]
+
+    C = torch.cdist(X.unsqueeze(0), Y.unsqueeze(0)).squeeze(0)
+    if use_quadratic_cost:
+        C = 0.5 * C * C
+    logK = -C / eps
+
+    log_a = torch.full((n,), -math.log(n), device=device, dtype=dtype)
+    if target_weights is None:
+        log_b = torch.full((m,), -math.log(m), device=device, dtype=dtype)
+    else:
+        b = target_weights.to(device=device, dtype=dtype)
+        b = b / b.sum().clamp_min(1e-12)
+        log_b = torch.log(b.clamp_min(1e-30))
+
+    log_u = torch.zeros_like(log_a)
+    log_v = torch.zeros_like(log_b)
+    for _ in range(max(int(num_iter), 1)):
+        log_u = log_a - torch.logsumexp(logK + log_v[None, :], dim=-1)
+        log_v = log_b - torch.logsumexp(logK.t() + log_u[None, :], dim=-1)
+    return torch.exp(log_u[:, None] + logK + log_v[None, :])
+
+
+@torch.no_grad()
+def _per_cluster_bary(
+    z: torch.Tensor,           # [B, N, D]
+    support: torch.Tensor,     # [B, M, D]
+    labels_z: torch.Tensor,    # [B, N]
+    labels_s: torch.Tensor,    # [B, M]
+    K: int,
+    eps: torch.Tensor,
+    num_iter: int,
+    target_weights: torch.Tensor | None = None,   # [B, M]
+    use_quadratic_cost: bool = False,
+) -> torch.Tensor:
+    """K independent Sinkhorn problems within each cluster.
+
+    Real speedup vs the block-mask Sinkhorn: total cost ≈ K * (N/K)^2 = N^2/K
+    instead of N^2. Loops over (B, K); fine for small K. For empty z-clusters
+    the corresponding rows of T are left at z (zero velocity contribution).
+    """
+    B, N, D = z.shape
+    T = z.clone()  # default: identity, so V contribution is 0 for empty clusters
+    for b in range(B):
+        for k in range(int(K)):
+            zmask = labels_z[b] == k
+            smask = labels_s[b] == k
+            nz = int(zmask.sum().item())
+            ms = int(smask.sum().item())
+            if nz == 0:
+                continue
+            if ms == 0:
+                # cluster has no support points: keep z (T = z) so V_pos = V_neg = 0
+                continue
+            zk = z[b, zmask]
+            sk = support[b, smask]
+            tw = None if target_weights is None else target_weights[b, smask]
+            Pi = _sinkhorn_small(
+                zk, sk, eps=eps, num_iter=num_iter,
+                target_weights=tw, use_quadratic_cost=use_quadratic_cost,
+            )
+            row_mass = Pi.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            Tk = Pi @ sk / row_mass
+            T[b, zmask] = Tk
+    return T
+
+
+@torch.no_grad()
 def _compute_V_clustered(
     z: torch.Tensor,
     w_pos: torch.Tensor,
@@ -511,26 +590,69 @@ def _compute_V_clustered(
     cfg_weight: torch.Tensor | None = None,
     w_uncond: torch.Tensor | None = None,
     use_quadratic_cost: bool = False,
+    cluster_centroids: torch.Tensor | None = None,
+    use_per_cluster_sinkhorn: bool = True,
 ) -> torch.Tensor:
     """Cluster-wise debiased OT velocity V = T_pq - T_qneg (+ optional CFG).
 
-    A single batched k-means on (z ⊕ pos ⊕ neg [⊕ uncond]) gives a shared
-    partition so every barycentric map respects the same cluster structure.
+    Two clustering paths:
+        * cluster_centroids is None: batched k-means on (z ⊕ pos ⊕ neg [⊕ uncond])
+          — re-clustering per call (high variance across calls).
+        * cluster_centroids provided ([K,D] or [B,K,D]): "sticky" — just assign,
+          no k-means. Use this to share a partition across mini-batches.
+
+    Two Sinkhorn paths:
+        * use_per_cluster_sinkhorn=True (default, only for "hard"): K small
+          Sinkhorns within each cluster. Real ~K-fold speedup, no off-block leak.
+        * False / "soft": block-mask Sinkhorn (single batched call).
     """
-    parts = [z, w_pos, w_neg]
-    if cfg_weight is not None and w_uncond is not None:
-        parts.append(w_uncond)
-    union = torch.cat(parts, dim=1)
-    labels_u, centroids = batched_kmeans(union, K=n_clusters)
+    B = z.shape[0]
+    has_uncond = cfg_weight is not None and w_uncond is not None
 
-    N = z.shape[1]
-    P = w_pos.shape[1]
-    Q = w_neg.shape[1]
-    labels_z = labels_u[:, :N]
-    labels_p = labels_u[:, N:N + P]
-    labels_n = labels_u[:, N + P:N + P + Q]
-    labels_u_ = labels_u[:, N + P + Q:] if cfg_weight is not None and w_uncond is not None else None
+    if cluster_centroids is not None:
+        centroids = expand_centroids(cluster_centroids.to(z), B)
+        labels_z = assign_to_centroids(z, centroids)
+        labels_p = assign_to_centroids(w_pos, centroids)
+        labels_n = assign_to_centroids(w_neg, centroids)
+        labels_u_ = assign_to_centroids(w_uncond, centroids) if has_uncond else None
+    else:
+        parts = [z, w_pos, w_neg]
+        if has_uncond:
+            parts.append(w_uncond)
+        union = torch.cat(parts, dim=1)
+        labels_u, centroids = batched_kmeans(union, K=n_clusters)
+        N = z.shape[1]
+        P = w_pos.shape[1]
+        Q = w_neg.shape[1]
+        labels_z = labels_u[:, :N]
+        labels_p = labels_u[:, N:N + P]
+        labels_n = labels_u[:, N + P:N + P + Q]
+        labels_u_ = labels_u[:, N + P + Q:] if has_uncond else None
 
+    # --- per-cluster Sinkhorn (real speedup) for hard mode ---
+    if cluster_mode == "hard" and use_per_cluster_sinkhorn:
+        T_pq = _per_cluster_bary(
+            z, w_pos, labels_z, labels_p, n_clusters,
+            eps=eps, num_iter=num_iter,
+            use_quadratic_cost=use_quadratic_cost,
+        )
+        T_qneg = _per_cluster_bary(
+            z, w_neg, labels_z, labels_n, n_clusters,
+            eps=eps, num_iter=num_iter,
+            target_weights=neg_target_weights,
+            use_quadratic_cost=use_quadratic_cost,
+        )
+        V = T_pq - T_qneg
+        if labels_u_ is not None:
+            T_quncond = _per_cluster_bary(
+                z, w_uncond, labels_z, labels_u_, n_clusters,
+                eps=eps, num_iter=num_iter,
+                use_quadratic_cost=use_quadratic_cost,
+            )
+            V = V + cfg_weight.view(-1, 1, 1) * (T_pq - T_quncond)
+        return V
+
+    # --- block-mask path (mathematically cluster-wise, no speedup) ---
     bary_kw = dict(eps=eps, num_iter=num_iter, mask_lambda=mask_lambda,
                    use_quadratic_cost=use_quadratic_cost,
                    cluster_mode=cluster_mode, centroids=centroids)
@@ -542,15 +664,12 @@ def _compute_V_clustered(
         z, w_neg, labels_z=labels_z, labels_s=labels_n,
         target_weights=neg_target_weights, **bary_kw,
     )
-
     V = T_pq - T_qneg
-
     if labels_u_ is not None:
         T_quncond = _barycentric_map_clustered(
             z, w_uncond, labels_z=labels_z, labels_s=labels_u_, **bary_kw,
         )
         V = V + cfg_weight.view(-1, 1, 1) * (T_pq - T_quncond)
-
     return V
 
 
@@ -578,6 +697,8 @@ def drift_loss_ot(
     cluster_mode: str = "none",
     n_clusters: int = 8,
     mask_lambda: float = 1.0,
+    cluster_centroids: torch.Tensor | None = None,
+    use_per_cluster_sinkhorn: bool = True,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Debiased entropic-OT drifting loss.
 
@@ -692,6 +813,11 @@ def drift_loss_ot(
                     cfg_weight=cfg_weight_per_sample,
                     w_uncond=uncond_scaled,
                     use_quadratic_cost=use_quadratic_cost,
+                    cluster_centroids=(
+                        cluster_centroids.to(old_gen_scaled) / scale_inputs
+                        if cluster_centroids is not None else None
+                    ),
+                    use_per_cluster_sinkhorn=use_per_cluster_sinkhorn,
                 )
                 f_norm = (V_raw ** 2).mean()
                 info[f"loss_{R}"] = f_norm
