@@ -693,14 +693,27 @@ def _apply_outer_gamma(
     labels_z: torch.Tensor,   # [B, N]
     beta: torch.Tensor,       # [B, K]
     off_target: torch.Tensor, # [B, K, D]
+    z: torch.Tensor,          # [B, N, D]   source positions
 ) -> torch.Tensor:
-    """T̃(x_i) = β_{k_i} · T_within(x_i) + (1-β_{k_i}) · off_target_{k_i}."""
+    """Additive outer-Γ correction:
+
+        T̃(x_i) = T_within(x_i) + (1-β_{k_i}) · (off_target_{k_i} - x_i)
+
+    At q=p the marginals match → Γ ≈ I → β=1 → correction=0 → T̃ = T_within
+    so V vanishes correctly (Thm 2). At α<1 with mass missing from some p
+    cluster, β<1 and off_target pulls x_i toward those missing centroids.
+
+    Earlier multiplicative form (β·T_within + (1-β)·off_target) shrank T̃
+    toward off_target=0 even when off-coupling was tiny, producing a
+    constant residual V ≈ (β-1)·x_i ≠ 0 at q=p.
+    """
     beta_pp = beta.gather(1, labels_z)                                # [B, N]
     D = T_within.shape[-1]
     off_pp = off_target.gather(
         1, labels_z.unsqueeze(-1).expand(-1, -1, D),
     )                                                                  # [B, N, D]
-    return beta_pp.unsqueeze(-1) * T_within + (1 - beta_pp.unsqueeze(-1)) * off_pp
+    one_minus = (1.0 - beta_pp).unsqueeze(-1)
+    return T_within + one_minus * (off_pp - z)
 
 
 @torch.no_grad()
@@ -793,12 +806,12 @@ def _compute_V_clustered(
                 centroids, centroids, cz, cp,
                 eps_gamma=outer_gamma_eps, num_iter=num_iter,
             )
-            T_pq = _apply_outer_gamma(T_pq, labels_z, beta_p, off_p)
+            T_pq = _apply_outer_gamma(T_pq, labels_z, beta_p, off_p, z=z)
             beta_n, off_n = _outer_gamma_targets(
                 centroids, centroids, cz, cn,
                 eps_gamma=outer_gamma_eps, num_iter=num_iter,
             )
-            T_qneg = _apply_outer_gamma(T_qneg, labels_z, beta_n, off_n)
+            T_qneg = _apply_outer_gamma(T_qneg, labels_z, beta_n, off_n, z=z)
 
         V = T_pq - T_qneg
         if labels_u_ is not None:
@@ -813,7 +826,7 @@ def _compute_V_clustered(
                     centroids, centroids, cz, cu,
                     eps_gamma=outer_gamma_eps, num_iter=num_iter,
                 )
-                T_quncond = _apply_outer_gamma(T_quncond, labels_z, beta_u, off_u)
+                T_quncond = _apply_outer_gamma(T_quncond, labels_z, beta_u, off_u, z=z)
             V = V + cfg_weight.view(-1, 1, 1) * (T_pq - T_quncond)
         return V
 
