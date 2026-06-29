@@ -14,6 +14,7 @@ import torch
 from einops import rearrange, repeat
 from tqdm import tqdm
 
+from cluster_stats import ClusterStats, build_feature_pool_from_bank
 from dataset.dataset import get_postprocess_fn, infinite_sampler
 from drift_loss import drift_loss
 from drift_loss_ot import drift_loss_ot
@@ -238,6 +239,17 @@ def train_step(
                     ot_loss_kwargs["cluster_mode"] = _ot_kw.get("cluster_mode", "none")
                     ot_loss_kwargs["n_clusters"] = _ot_kw.get("n_clusters", 8)
                     ot_loss_kwargs["mask_lambda"] = _ot_kw.get("mask_lambda", 1.0)
+                    ot_loss_kwargs["use_per_cluster_sinkhorn"] = _ot_kw.get("use_per_cluster_sinkhorn", True)
+                    ot_loss_kwargs["use_outer_gamma"] = _ot_kw.get("use_outer_gamma", False)
+                    ot_loss_kwargs["outer_gamma_eps"] = _ot_kw.get("outer_gamma_eps", 0.01)
+                    ot_loss_kwargs["outer_gamma_iter"] = _ot_kw.get("outer_gamma_iter", 200)
+                    ot_loss_kwargs["cluster_pos"] = _ot_kw.get("cluster_pos", True)
+                    # sticky tensors are injected by the outer loop (centroids
+                    # + pool marginal precomputed from the positive memory bank)
+                    if "cluster_centroids" in _ot_kw and _ot_kw["cluster_centroids"] is not None:
+                        ot_loss_kwargs["cluster_centroids"] = _ot_kw["cluster_centroids"]
+                    if "cluster_marg_p_pool" in _ot_kw and _ot_kw["cluster_marg_p_pool"] is not None:
+                        ot_loss_kwargs["cluster_marg_p_pool"] = _ot_kw["cluster_marg_p_pool"]
 
                     if _use_new_cfg:
                         cfg_w = repeat(chunk_cfg - 1.0, "b -> (b f)", f=Bf // max(1, chunk_cfg.shape[0]))
@@ -440,10 +452,43 @@ def train_gen(
     step = int(state.step)
     initial_step = step
     pbar = tqdm(range(step, total_steps), initial=step, total=total_steps) if is_rank_zero() else range(step, total_steps)
-    memory_bank_positive = ArrayMemoryBank(num_classes=1000, max_size=positive_bank_size)
+    num_classes_bank = int(getattr(train_loader.dataset, "num_classes", 1000)) if hasattr(train_loader, "dataset") else 1000
+    memory_bank_positive = ArrayMemoryBank(num_classes=num_classes_bank, max_size=positive_bank_size)
     memory_bank_negative = ArrayMemoryBank(num_classes=1, max_size=negative_bank_size)
     train_iter = infinite_sampler(train_loader, step)
     _ot_kw = dict(ot_kwargs) if ot_kwargs else {}
+
+    # --- CWG-E: sticky cluster statistics (centroids + pool marg_p) ---
+    # Only active when cluster_mode != "none". Refresh cadence in steps:
+    #   <= 0 (default 0) => compute ONCE after warmup, then frozen.
+    #   > 0              => recompute every N steps to track feature drift.
+    _cluster_active = _ot_kw.get("cluster_mode", "none") != "none"
+    cluster_stats = None
+    sticky_refresh_steps = int(_ot_kw.get("sticky_refresh_steps", 0))
+    sticky_warmup_steps = int(_ot_kw.get("sticky_warmup_steps", 50))
+    sticky_samples_per_class = int(_ot_kw.get("sticky_samples_per_class", 4))
+    sticky_max_pool_tokens = int(_ot_kw.get("sticky_max_pool_tokens", 200_000))
+    sticky_extract_chunk = int(_ot_kw.get("sticky_extract_chunk", 256))
+    sticky_kmeans_iter = int(_ot_kw.get("sticky_kmeans_iter", 30))
+    sticky_kmeans_iter_warm = int(_ot_kw.get("sticky_kmeans_iter_warm", 10))
+    sticky_feature_key = _ot_kw.get("sticky_feature_key", None)  # None => first key
+    if _cluster_active:
+        # Same seed across ranks => deterministic k-means init => identical
+        # centroids (combined with all-gather + broadcast safety net in
+        # cluster_stats.refresh). Do NOT add process_index() here.
+        cluster_stats = ClusterStats(
+            n_clusters=int(_ot_kw.get("n_clusters", 8)),
+            device=device,
+            seed=int(seed),
+            kmeans_iter=sticky_kmeans_iter,
+            kmeans_iter_warm=sticky_kmeans_iter_warm,
+        )
+        log_for_0(
+            "CWG-E sticky stats enabled (world=%d, K=%d, refresh=%d, "
+            "warmup=%d, samples/class=%d, max_pool_global=%d)",
+            process_count(), cluster_stats.n_clusters, sticky_refresh_steps,
+            sticky_warmup_steps, sticky_samples_per_class, sticky_max_pool_tokens,
+        )
 
     for step in pbar:
         start_time = time.time()
@@ -475,6 +520,51 @@ def train_gen(
 
         positive_samples = memory_bank_positive.sample(labels_sel, n_samples=pos_per_sample)
         negative_samples = memory_bank_negative.sample(labels_sel * 0, n_samples=neg_per_sample)
+
+        # --- CWG-E: maybe refresh sticky cluster stats from the positive bank ---
+        # Decision (step >= warmup AND should_refresh) is rank-invariant —
+        # critical for DDP: refresh internally all-gathers, so all ranks
+        # MUST enter the branch in lock-step or the gather hangs.
+        if cluster_stats is not None and step >= sticky_warmup_steps \
+                and cluster_stats.should_refresh(step, sticky_refresh_steps):
+            def _extract(imgs):
+                # imgs: [N, h, w, c] or [N, n_samples, h, w, c] -> dict | tensor
+                if imgs.dim() == 5:
+                    imgs = rearrange(imgs, "b x h w c -> (b x) h w c")
+                return activation_fn(feature_params, imgs, **activation_kwargs)
+
+            # Discover the feature key once (config override or probe).
+            # Each rank probes independently — deterministic given same model.
+            if sticky_feature_key is None:
+                _probe_imgs = torch.as_tensor(positive_samples, device=device)[:1, :1]
+                _probe = _extract(_probe_imgs)
+                sticky_feature_key = next(iter(_probe.keys())) if isinstance(_probe, dict) else None
+                log_for_0("CWG-E sticky_feature_key auto-resolved to %r", sticky_feature_key)
+
+            feat_pool_local = build_feature_pool_from_bank(
+                memory_bank_positive,
+                _extract,
+                feature_key=sticky_feature_key,
+                n_classes=num_classes_bank,
+                samples_per_class=sticky_samples_per_class,
+                device=device,
+                max_pool_tokens=sticky_max_pool_tokens,
+                extract_chunk=sticky_extract_chunk,
+            )
+            # refresh() all-gathers + (optionally) broadcasts internally.
+            cluster_stats.refresh(feat_pool_local, step=step)
+            log_for_0(
+                "CWG-E sticky refresh @ step %d: global_pool=%d tokens, K=%d, "
+                "marg_p min/max=%.3f/%.3f",
+                step, cluster_stats.pool_size, cluster_stats.n_clusters,
+                float(cluster_stats.marg_p_pool.min()),
+                float(cluster_stats.marg_p_pool.max()),
+            )
+
+        # Inject sticky tensors into the per-step ot_kwargs (no-op if not ready)
+        if cluster_stats is not None and cluster_stats.is_ready():
+            _ot_kw["cluster_centroids"]   = cluster_stats.centroids
+            _ot_kw["cluster_marg_p_pool"] = cluster_stats.marg_p_pool
 
         process_time = time.time() - start_time
 

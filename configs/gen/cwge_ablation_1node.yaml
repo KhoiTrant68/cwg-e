@@ -88,9 +88,45 @@ train:
     use_quadratic_cost: true
 
     # --- CWG-E additions ---
+    # Set cluster_mode: "none" to reproduce W-Flow exactly (bit-for-bit ablation arm).
     cluster_mode: "hard"          # "none" | "hard" | "soft"
     n_clusters: 8
     mask_lambda: 1.0              # only used by "soft"
+
+    # Per-cluster Sinkhorn: K small batched OT problems instead of one N×N.
+    # Recommended TRUE; collapses without outer Γ on unstable training.
+    use_per_cluster_sinkhorn: true
+
+    # Outer Γ centroid coupling: restores "V → 0 iff q=p" (Thm B.2).
+    # Without this, cluster-only drift has a spurious-equilibrium set
+    # parameterised by mismatched cluster masses (Cor B.3 in docs/theory.md).
+    use_outer_gamma: true
+    outer_gamma_eps: 0.01         # sharper => β closer to 1 at q=p
+    outer_gamma_iter: 200         # needed at small eps for convergence
+
+    # cluster_pos:  true  => both T_pq and T_qneg are clustered (validated 2D)
+    #               false => T_pq stays global (coverage signal),
+    #                        T_qneg clustered+outer-Γ (repulsion). Use this
+    #                        if you see Gate-2 style collapse in training.
+    cluster_pos: true
+
+    # --- Sticky population statistics (cluster_stats.py) ---
+    # Centroids and pool marginal precomputed once from the positive memory
+    # bank at warmup, then frozen (sticky_refresh_steps = 0) or refreshed
+    # on a cadence to track slow drift.
+    #
+    # Distributed (DDP) is fully supported: each rank builds a partial pool
+    # of size max_pool_tokens/world from a disjoint class range; refresh()
+    # all-gathers into one global pool of ``max_pool_tokens`` and broadcasts
+    # bitwise-identical centroids from rank 0 to all ranks.
+    sticky_warmup_steps: 200      # wait for memory bank to fill
+    sticky_refresh_steps: 0       # 0 = frozen after first compute; >0 = re-cluster cadence (steps)
+    sticky_samples_per_class: 4   # bank samples per class for the feature pool
+    sticky_max_pool_tokens: 200000  # GLOBAL pool size cap (per-rank = this / world)
+    sticky_extract_chunk: 256     # MAE forward batch during refresh — lower if OOM
+    sticky_kmeans_iter: 30        # iters for first (cold) k-means
+    sticky_kmeans_iter_warm: 10   # iters for subsequent (warm-started) refreshes
+    # sticky_feature_key: null    # null => auto-resolve first feature head
 
 feature:
   mae_path: "hf://mae_latent_256"
