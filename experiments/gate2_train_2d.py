@@ -196,6 +196,7 @@ VARIANTS = {
     "hard_outerG":    ("hard", True,  True),   # only variant with non-degenerate field (thm_no_spurious)
     "hard_globalpos": ("hard", False, False),  # global T_pq + clustered T_qneg
     "soft_globalpos": ("soft", False, False),
+    "hard_glob_outerGneg": ("hard", True,  False),  # global T_pq (stable) + outer-Γ repulsion on T_qneg
 }
 
 
