@@ -69,6 +69,8 @@ def _train_one(
     lr: float,
     seed: int,
     dev: torch.device,
+    use_outer_gamma: bool = False,
+    cluster_pos: bool = True,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -91,7 +93,8 @@ def _train_one(
     # Sinkhorn produces V = 0 for points whose cluster is empty on the gen
     # side, which permanently traps mode-collapsed runs. Block-mask leaks a
     # small amount of mass through dual potentials and lets training recover.
-    use_per_cluster_sinkhorn = False
+    # outer-Gamma is only wired in the per-cluster path; enable it there.
+    use_per_cluster_sinkhorn = bool(use_outer_gamma) and cluster_mode == "hard"
 
     t0 = time.time()
     for step in range(steps):
@@ -119,6 +122,8 @@ def _train_one(
             mask_lambda=1.0,
             cluster_centroids=centroids_fixed,
             use_per_cluster_sinkhorn=use_per_cluster_sinkhorn,
+            use_outer_gamma=use_outer_gamma,
+            cluster_pos=cluster_pos,
         )
         opt.zero_grad()
         loss.mean().backward()
@@ -134,6 +139,8 @@ def _train_one(
     metrics = dict(
         toy=toy,
         cluster_mode=cluster_mode,
+        use_outer_gamma=use_outer_gamma,
+        cluster_pos=cluster_pos,
         n_clusters=n_clusters,
         steps=steps,
         wall_s=round(wall, 2),
@@ -181,56 +188,75 @@ def _scatter(ax, samples, centres, n_dom, title):
     ax.set_ylim(-3.2, 3.2)
 
 
+# variant name -> (cluster_mode, use_outer_gamma, cluster_pos)
+VARIANTS = {
+    "none":           ("none", False, True),
+    "hard":           ("hard", False, True),
+    "soft":           ("soft", False, True),
+    "hard_outerG":    ("hard", True,  True),   # only variant with non-degenerate field (thm_no_spurious)
+    "hard_globalpos": ("hard", False, False),  # global T_pq + clustered T_qneg
+    "soft_globalpos": ("soft", False, False),
+}
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--steps", type=int, default=4000)
+    parser.add_argument("--steps", type=int, default=3000)
     parser.add_argument("--batch", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--toys", nargs="+",
                         default=["ring8", "grid25", "ring_minority"])
-    parser.add_argument("--modes", nargs="+",
-                        default=["none", "hard", "soft"])
     parser.add_argument("--n-clusters", type=int, default=8)
+    parser.add_argument("--variants", nargs="+", default=list(VARIANTS.keys()))
     args = parser.parse_args()
 
     dev = device()
-    print(f"[gate2] device={dev}  steps={args.steps}  batch={args.batch}")
+    print(f"[gate2-v2] device={dev}  steps={args.steps}  batch={args.batch}")
+    print(f"[gate2-v2] variants: {args.variants}")
 
     od = out_dir()
     rows = []
 
-    fig, axes = plt.subplots(len(args.toys), len(args.modes),
-                             figsize=(3.6 * len(args.modes), 3.6 * len(args.toys)),
+    fig, axes = plt.subplots(len(args.toys), len(args.variants),
+                             figsize=(3.4 * len(args.variants), 3.4 * len(args.toys)),
                              squeeze=False)
 
     for i, toy in enumerate(args.toys):
-        for j, mode in enumerate(args.modes):
+        for j, vname in enumerate(args.variants):
+            cmode, oG, cpos = VARIANTS[vname]
             m, samples, centres, n_dom = _train_one(
-                toy=toy, cluster_mode=mode, n_clusters=args.n_clusters,
+                toy=toy, cluster_mode=cmode, n_clusters=args.n_clusters,
                 steps=args.steps, batch=args.batch, lr=args.lr,
                 seed=args.seed, dev=dev,
+                use_outer_gamma=oG, cluster_pos=cpos,
             )
-            print(f"[gate2] toy={toy:14s}  mode={mode:5s}  "
+            m["variant"] = vname
+            print(f"[gate2-v2] toy={toy:14s}  variant={vname:14s}  "
                   f"W2^2={m['w2_sq']:.4f}  cov={m['mode_coverage']:.3f}  "
-                  f"min={m['minority_recall']}  mmd={m['mmd']:.4f}  "
-                  f"wall={m['wall_s']}s")
+                  f"min={m['minority_recall']}  mmd={m['mmd']:.4f}")
             rows.append(m)
             _scatter(axes[i][j], samples, centres, n_dom,
-                     f"{toy} / {mode}\nW2^2={m['w2_sq']:.3f}  cov={m['mode_coverage']:.2f}")
+                     f"{toy} / {vname}\nW2^2={m['w2_sq']:.3f}  cov={m['mode_coverage']:.2f}")
 
-    plt.suptitle("Gate 2 — one-step generator, 2D toys", fontsize=11)
+    plt.suptitle("Gate 2 v2 — one-step generator, variant sweep", fontsize=11)
     plt.tight_layout()
-    fig_path = od / "gate2_2d_samples.png"
+    fig_path = od / "gate2_v2_samples.png"
     plt.savefig(fig_path, dpi=130, bbox_inches="tight")
-    print(f"[gate2] figure -> {fig_path}")
+    print(f"[gate2-v2] figure -> {fig_path}")
 
-    csv_path = od / "gate2_metrics.csv"
+    csv_path = od / "gate2_v2_metrics.csv"
+    # union of keys across rows (variants differ in fields)
+    keys = []
+    for r in rows:
+        for k in r:
+            if k not in keys:
+                keys.append(k)
     with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w = csv.DictWriter(f, fieldnames=keys)
         w.writeheader()
         w.writerows(rows)
-    print(f"[gate2] metrics -> {csv_path}")
+    print(f"[gate2-v2] metrics -> {csv_path}")
 
 
 if __name__ == "__main__":
