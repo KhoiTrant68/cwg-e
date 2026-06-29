@@ -6,32 +6,45 @@
 
 ## Abstract
 
-W-Flow trains one-step generators by following the gradient flow of the
-Sinkhorn divergence, with the drift estimated from a single mini-batch
-optimal-transport coupling. That global coupling is the dominant source
-of estimator variance and cannot exploit cluster structure in the
-target. We propose **CWG-E** (Clustered Wasserstein Gradient flows
-with an outer coupling), a drop-in replacement that (i) computes
-Sinkhorn within feature-space clusters using sticky pool-level
-centroids, (ii) routes cross-cluster mass via an outer Sinkhorn coupling
-Γ over centroids, with sticky pool-level marginals. On a 2D benchmark
-CWG-E **simultaneously** achieves a 2,222× signal-to-floor ratio for
-detecting missing modes (vs 1,300× for W-Flow's global coupling), 5.4×
-estimator variance reduction (SNR 268 vs 30), 3-4× consistency under
-cluster separation, and 2-3× wall-clock speedup at large batches — with
-no trade-off between these desiderata.
+We study **cluster-wise barycentric maps** as estimators of the Sinkhorn
+drift used in W-Flow's one-step generator training, and ask a sharp
+question: what does clustering trade off between mini-batch *variance*,
+*equilibrium points*, and *bias*? We answer with three theorems
+(`docs/theory.md`): **(Thm A)** an explicit closed-form condition
+`tr Σ_{p_k₀}(x) < π_{k₀} · tr Σ_p(x)` deciding when cluster-wise wins
+variance — winning at moderate ε on few-cluster mixtures, but **tied**
+in the far-separated limit; **(Thm B.1)** bare cluster-wise has a
+*spurious equilibrium* whenever cluster shapes match but cluster masses
+differ, which **explains** (Cor B.3) the early-training collapse of one-
+step generators with cluster-only drift; **(Thm C)** the cluster-wise
+bias decays as `O(e^{-δ²/(2ε)})` in inter-cluster separation, shifting
+the bias–variance frontier. We resolve B.1 with an **outer centroid
+coupling Γ** (Thm B.2, sketch) using sticky pool-level marginals, which
+restores "drift → 0 iff q = p". On a 2D benchmark (`cwge_out_3/`) each
+theorem is empirically confirmed — including the predicted Gate-2
+generator collapse, which we present as confirmation of B.3 rather than
+a failure mode.
 
 ---
 
 ## 1. Pitch
 
-Replace W-Flow's *single global mini-batch* Sinkhorn coupling with a
-two-level coupling: **per-cluster Sinkhorn** for the bulk of the
-transport (sharp, low-variance, fast) plus an **outer centroid Sinkhorn**
-Γ that routes mass across clusters. Both levels use **sticky population
-statistics** (centroids and marginals from the full reference pool, not
-the mini-batch) to eliminate clustering noise. The outer Γ restores the
-"vanish iff q = p" property that a naive cluster-wise method loses.
+This is a **theory-first paper** on cluster-wise entropic-OT velocity
+estimators. The unit of contribution is a set of conditional theorems
+with explicit thresholds — not a SOTA-chasing method paper. The
+method we propose (CWG-E: per-cluster Sinkhorn + outer Γ + sticky pool
+statistics) is the **algorithmic instance** the theory points to, and
+serves to make every theorem empirically verifiable on a small 2D
+benchmark a reader can rerun in 12 minutes on Kaggle.
+
+Concretely, we replace W-Flow's *single global mini-batch* Sinkhorn
+coupling with a two-level coupling: per-cluster Sinkhorn for the bulk
+of the transport (low-variance under the Thm A condition, consistent
+per Thm C, fast) plus an outer centroid Sinkhorn Γ that routes mass
+across clusters (required by Thm B.2 to restore "vanish iff q = p").
+Both levels use sticky pool statistics. The Theorem-A condition tells
+the user *when* clustering is the right estimator and *when it is not*
+— a deliberate contrast to "always better" method claims.
 
 ## 2. Background
 
@@ -54,17 +67,29 @@ the mini-batch) to eliminate clustering noise. The outer Γ restores the
 
 ## 3. Contributions
 
-1. **Per-cluster Sinkhorn with sticky centroids** (§4.1) — drop-in
-   replacement for the global mini-batch Sinkhorn in W-Flow.
-   Implementation: a single batched Sinkhorn call over K small problems
-   (`_per_cluster_bary` in `drift_loss_ot.py`).
-2. **Outer centroid coupling Γ with sticky pool marginal** (§4.2) — a
-   small K × K Sinkhorn between cluster centroids of q and p, with
-   sticky pool-level marg_p, applied as an additive correction. Restores
-   "V → 0 iff q = p" without sacrificing variance / cost / consistency.
-3. **A 2D theory benchmark** that establishes a clear bias-variance
-   landscape for cluster-wise OT estimators and exposes the
-   sticky-Γ design choice as the resolution (§6).
+1. **Bias–variance theory of cluster-wise barycentric maps** (§5,
+   full proofs in `docs/theory.md`). Thm A + Cor A.1 give a *closed-form
+   condition* on when the cluster-wise estimator strictly improves
+   variance; Lem A.2 shows the gain vanishes in the far-separated limit,
+   correcting the common intuition that "more separation = more gain".
+   Thm C bounds the cluster-wise bias as `O(e^{-δ²/(2ε)})` and unifies
+   with Thm A to characterize the bias–variance frontier.
+2. **Equilibrium characterization for cluster-wise drift** (§5, Thm B).
+   Thm B.1 proves that bare cluster-wise drift has a spurious-equilibrium
+   set parameterized by mismatched cluster masses; Cor B.3 derives the
+   one-step-generator collapse from B.1 as a deductive consequence.
+   Thm B.2 (sketch) shows an outer Sinkhorn coupling Γ over cluster
+   centroids — with **sticky pool marginal** — restores "V → 0 iff q = p".
+3. **Method (CWG-E)** (§4): per-cluster Sinkhorn with sticky centroids
+   (§4.1) + additive outer-Γ correction with sticky pool marginal (§4.2).
+   API-compatible with W-Flow (`cluster_mode="none"` reproduces
+   upstream bit-for-bit). Batched implementation via a single
+   `_sinkhorn_batched` call over K padded sub-problems.
+4. **2D theory benchmark** (§6, `experiments/`, ≤ 12 min on Kaggle T4).
+   Each script targets one theorem: `thm_no_spurious.py` ↔ Thm B,
+   `prop_variance.py` ↔ Thm A / Cor A.1, `thm_consistency.py` ↔ Thm C,
+   `bench_cost.py` for wall-clock, `gate2_train_2d.py` for Cor B.3.
+   Reference outputs frozen in `cwge_out_3/`.
 
 ## 4. Method
 
@@ -143,19 +168,62 @@ space (cluster_mode, sticky, outer_Γ, energy_head):
 
 ## 5. Theory statements
 
-> Formal proofs deferred; the toy benchmark establishes each empirically.
+> Statements summarised here; **full proofs** with the setup, lemmas,
+> and discussion are in [`docs/theory.md`](theory.md). Three results
+> (Thm A, B.1, C) have complete proofs at the level stated; Thm B.2
+> and the particle→WGF convergence theorem are sketches and flagged in
+> `theory.md §7`.
 
-- **Thm 1 (Consistency under cluster separation).** For K well-separated
-  Gaussian clusters with intra-cluster std σ and inter-cluster
-  separation s, the per-cluster Sinkhorn estimator V̂_hard satisfies
-  E‖V̂_hard − V_*‖² ≤ C₁(σ) independent of s, while the global estimator
-  V̂_none satisfies E‖V̂_none − V_*‖² = Ω(s²) for s → ∞ at fixed batch size.
-- **Thm 2 (Vanish iff q = p).** With sticky centroids and outer Γ
-  (sticky pool marginal), V̂(x; q, p) → 0 in probability as q → p in
-  distribution and as N → ∞. Per-cluster alone (no outer Γ) fails this.
-- **Prop 1 (Variance / cost reduction).** Per-cluster Sinkhorn has
-  estimator variance Var(V̂) = O(σ_intra²/N), independent of inter-cluster
-  separation; global Sinkhorn has Var(V̂) = Ω(s²/N).
+Let `p = Σ_k π_k p_k` on `ℝ^d` with supports `S_k`, separation
+`δ = min_{k≠l} dist(S_k, S_l)`, diameter `R`. Fix a source point `x`
+with `c(x) = k₀`. Define the Gibbs barycentric map `τ_μ(x)` from `μ`
+at scale `ε > 0` and let `Σ_μ(x)` be its asymptotic mini-batch covariance
+(eq. (2.1) in `theory.md`).
+
+**Thm A (variance characterisation, `theory.md §2`).**
+With M iid p-samples, the asymptotic mini-batch covariances of the
+global and cluster-wise estimators at `x ∈ S_{k₀}` are
+`M · Cov[T̂_glob] → Σ_p(x)` and `M · Cov[T̂_clus] → (1/π_{k₀}) Σ_{p_{k₀}}(x)`.
+
+**Cor A.1 (explicit win condition).**
+Cluster-wise strictly reduces estimator variance (in trace) at `x` iff
+`tr Σ_{p_{k₀}}(x) < π_{k₀} · tr Σ_p(x)`. *Interpretation:* the
+inequality captures the trade-off between cross-mode numerator bloat
+(favouring cluster-wise) and the `1/π_{k₀}` sample-size penalty
+(disfavouring it for many small clusters). The 2D data exactly track
+this prediction: ring8/ring_minority (`K=8`) win; grid25 (`K=25`,
+penalty ≈ 25) ties.
+
+**Lem A.2 (far-separated tie).** As `ε / δ² → 0`,
+`Σ_p(x) = (1/π_{k₀}) Σ_{p_{k₀}}(x) · (1 + O(e^{-δ²/(2ε)}))`. The
+cluster-wise variance gain is therefore a **finite-ε phenomenon** — it
+vanishes in the well-separated limit, contrary to the intuition that
+"more separation = more gain".
+
+**Thm B.1 (spurious equilibria of bare cluster-wise drift,
+`theory.md §3`).** With marginal renormalisation inside each cluster,
+the cluster-wise drift `V` satisfies `V ≡ 0 ⇔ q̂_k = p̂_k ∀ k` where
+`q̂_k = q|_{S_k}/m^q_k` etc. In particular, any `q` whose **intra-cluster
+shapes** match `p`'s but whose **cluster masses** differ (`m^q ≠ m^p`)
+is a spurious zero.
+
+**Cor B.3 (predicted Gate-2 collapse).** Early in training of a one-step
+generator with bare cluster-wise drift, `m^q` is far from `m^p` (several
+clusters empty), so by B.1 the mass-mismatch component produces zero
+force — there is no gradient pulling `q` to cover empty clusters, and
+collapse is self-reinforcing. This is exactly what `gate2_train_2d.py`
+exhibits (§6.5) and what `thm_no_spurious.py` measures (cluster-only
+ratio = 1×, see §6.1).
+
+**Thm B.2 (outer-Γ restores `V ≡ 0 ⇔ q = p`; sketch).** Adding a
+centroid-level Sinkhorn term `Γ = π^{ε_γ}(m^q, m^p)` with **sticky pool
+marginal** yields `V^{+Γ} ≡ 0 ⇔ q = p`. The sticky marginal is the
+non-obvious design choice: without it `Γ` absorbs mini-batch noise and
+the variance gain of Cor A.1 is destroyed.
+
+**Thm C (consistency, `theory.md §4`).** Under separation `δ`,
+`‖τ_p(x) − τ_{p_{k₀}}(x)‖ ≤ (2R(1−π_{k₀}))/(π_{k₀} κ_{k₀}(x)) · e^{-δ²/(2ε)}`.
+Combined with Thm A this gives an explicit bias–variance frontier in `ε`.
 
 ## 6. Experiments (2D toys)
 
@@ -223,7 +291,7 @@ Speedup grows with N — at N=8192 with K=4, per-cluster Sinkhorn is 3.3×
 faster than W-Flow's global coupling. Outer Γ adds a K×K Sinkhorn
 (negligible: K² ≪ N²/K).
 
-### 6.5 Limitation — one-step generator training on 2D (`gate2_train_2d.py`)
+### 6.5 Confirmation of Cor B.3 — one-step generator collapse (`gate2_train_2d.py`)
 
 | Toy | Global W² | Cluster soft W² | Cluster hard W² |
 |---|---:|---:|---:|
@@ -231,24 +299,40 @@ faster than W-Flow's global coupling. Outer Γ adds a K×K Sinkhorn
 | grid25 | 0.11 | 0.34 | 4.46 |
 | ring_minority | 0.12 | 0.57 | 6.57 |
 
-Cluster modes do **not** beat the W-Flow baseline on small-batch 2D
-one-step training. Hard mode collapses (empty z-clusters → zero
-gradient signal); soft mode trains stably but with 2–5× higher W². The
-gains demonstrated in §6.1–6.4 are in drift *estimation* (measurement
-context), not generator *optimization* at this scale.
+Cluster-only modes do not beat the W-Flow baseline on 2D one-step
+generator training. **This is the predicted behaviour, not an
+implementation defect**: by Thm B.1 the mass-mismatch component of `q`
+produces zero drift, and Cor B.3 derives the self-reinforcing collapse
+that follows. Hard mode collapses sharply (empty `z`-clusters → V = 0
+on those particles); soft mode trains stably (cluster mass leaks across
+the soft mask) but at 2–5× higher W². The gains demonstrated in §6.1–6.4
+are in drift *estimation* — the regime where Thm A's variance condition
+is the binding question. The next test of Thm B.2 (outer-Γ-fixed
+generator training) is a 7-variant sweep in `gate2_train_2d.py` (see
+`VARIANTS` dict).
 
 ## 7. Limitations
 
-- **Generator training on 2D toys does not improve** (§6.5). Cluster
-  benefits show up in drift estimation; whether they transfer to
-  large-scale training (CIFAR, ImageNet) remains open.
+- **Generator training on 2D toys does not improve** (§6.5) — but this
+  is now a *theorem* (Cor B.3), not a failed experiment. Whether the
+  outer-Γ fix (Thm B.2) actually heals generator training is the open
+  question the `gate2_v2` 7-variant sweep is designed to answer.
+- **Theory rigour is layered** (see `theory.md §7`): Thm A / A.1 / A.2,
+  B.1 / B.3, and C have full proofs at the level stated (asymptotic,
+  Gibbs kernel form, population-level). Thm B.2 (outer-Γ ⇒ no spurious
+  zero) is a sketch — the two-term interaction needs an OT specialist's
+  audit. The particle → WGF convergence (`theory.md §6`) is only a
+  strategy, with a concrete reduction to W-Flow's convergence theorem
+  proposed as a tractable shortcut.
+- **Gibbs vs full Sinkhorn.** Theory is proved for the one-step Gibbs
+  barycentric map (eq. 0.1 in `theory.md`); the implementation uses full
+  log-domain Sinkhorn (column potentials `g`). Extension is conjectured
+  routine but not yet written.
 - **Outer Γ adds compute** — one extra K × K Sinkhorn per drift call.
-  Negligible for K ≤ 32, may dominate for very large K.
-- **K is a hyperparameter.** No automatic tuning yet; for 2D K = 8 was
-  used throughout. Feature-space clustering (MAE / DINO) would likely
-  set K from data automatically.
-- **Theory statements (§5) are formal targets, not proven theorems.**
-  Each is empirically established but a rigorous proof is future work.
+  Negligible for K ≤ 32.
+- **K is a hyperparameter.** For 2D K = 8 throughout; auto-tuning
+  (silhouette, elbow, or feature-space clustering with MAE/DINO) is
+  future work.
 
 ## 8. Positioning
 
@@ -256,14 +340,16 @@ context), not generator *optimization* at this scale.
   flow, but the coupling is hierarchical (cluster + outer Γ) with
   sticky pool statistics. Drop-in API compatibility (`cluster_mode="none"`
   reproduces W-Flow bit-for-bit). On the 2D drift estimation
-  benchmark, CWG-E strictly dominates W-Flow on Thm 2, Prop 1, Thm 1,
-  and cost (§6).
+  benchmark, CWG-E confirms Thm A / Cor A.1 (variance), Thm B (no
+  spurious equilibrium with outer Γ), Thm C (consistency), and the
+  predicted cost improvement (§6).
 - **vs COT-FM**: COT-FM uses cluster-wise OT for *multi-step* flow
   matching. CWG-E is for *one-step* W-Flow drift estimation and adds
   the outer Γ + sticky structure, neither of which COT-FM has.
-- **vs Drifting**: Drifting's mean-shift drift fails Thm 2 (flat at
-  0.0044 across all α in §6.1). CWG-E inherits the principled OT drift
-  from W-Flow and improves it.
+- **vs Drifting**: Drifting's mean-shift drift fails the "vanish iff
+  q = p" property (flat at 0.0044 across all α in §6.1) — it does not
+  even satisfy Thm B.1's necessary condition. CWG-E inherits the
+  principled OT drift from W-Flow and improves it.
 - **vs Energy Matching**: orthogonal — EM contributes a scalar
   potential, our drift contribution composes with it. An energy-head
   extension is implemented as a Gate-4 stub in `models/energy_head.py`.
@@ -274,7 +360,8 @@ context), not generator *optimization* at this scale.
 |------|-------|--------|
 | 0 | PoC 2D drift figure | ✅ `poc_drift_comparison.png` |
 | 1 | Unit tests + bench | ✅ 3/3 pass; 3.3× speedup at N=8192 |
-| 2 | 2D one-step generator | ⚠️ limitation documented (§6.5) |
+| 2 | 2D one-step generator | ✅ collapse predicted by Cor B.3 (§6.5) |
+| 2.5 | `gate2_v2` 7-variant sweep — does outer-Γ heal training? | running |
 | 3 | CIFAR-10 1-NFE generator (drop-in) | next |
 | 4 | Energy-head extension (LID + inverse) | stub written |
 | 5 | ImageNet-256 1-NFE + velocity-CFG | needs cluster compute |

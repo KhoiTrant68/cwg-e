@@ -5,8 +5,11 @@ Sinkhorn drift with an outer centroid coupling Γ.** Drop-in replacement
 for W-Flow's mini-batch global Sinkhorn. Code for the CVPR submission.
 
 This repo is a **fork of W-Flow** (full upstream README preserved below).
-Method is detailed in [`docs/proposal.md`](docs/proposal.md); the
-2D benchmark in [`experiments/`](experiments/) validates every claim.
+The work is **theory-first**: see [`docs/theory.md`](docs/theory.md) for
+the formal bias–variance / equilibrium / consistency theorems (full
+proofs at the level stated). [`docs/proposal.md`](docs/proposal.md) is
+the paper draft (Abstract / contributions / experiments). The 2D
+benchmark in [`experiments/`](experiments/) validates every theorem.
 
 ## What CWG-E adds
 
@@ -51,7 +54,7 @@ All five validated simultaneously, no trade-off. Numbers from
 | `scripts/train/cwge_ablation.sh` | **added** | launcher (needs full W-Flow data pipeline) |
 | `experiments/` | **added** | 7 scripts: PoC + Gate 2 + 3 theory + bench + runner |
 | `tests/test_drift_loss_clustered.py` | **added** | unit tests |
-| `docs/proposal.md`, `docs/design_doc.md` | **added** | research / implementation docs |
+| `docs/theory.md`, `docs/proposal.md`, `docs/design_doc.md` | **added** | theory (proofs) / paper draft / implementation docs |
 
 ## Quick checks
 
