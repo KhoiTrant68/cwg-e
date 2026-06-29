@@ -745,8 +745,13 @@ def _compute_V_clustered(
     outer_gamma_eps: float = 0.01,
     outer_gamma_iter: int = 200,
     cluster_marg_p_pool: torch.Tensor | None = None,
+    cluster_pos: bool = True,
 ) -> torch.Tensor:
     """Cluster-wise debiased OT velocity V = T_pq - T_qneg (+ optional CFG).
+
+    cluster_pos=False -> attraction term T_pq uses the GLOBAL barycentric
+    map (keeps a coverage signal toward un-covered modes), while T_qneg
+    stays cluster-wise. Breaks early-training mode-collapse.
 
     Two clustering paths:
         * cluster_centroids is None: batched k-means on (z ⊕ pos ⊕ neg [⊕ uncond])
@@ -782,13 +787,21 @@ def _compute_V_clustered(
         labels_n = labels_u[:, N + P:N + P + Q]
         labels_u_ = labels_u[:, N + P + Q:] if has_uncond else None
 
+    # Optional: global attraction term (keeps coverage signal in training)
+    T_pq_global = None
+    if not cluster_pos:
+        T_pq_global = _barycentric_map(
+            z, w_pos, eps=eps, num_iter=num_iter, diag_mask=False,
+            use_quadratic_cost=use_quadratic_cost,
+        )
+
     # --- per-cluster Sinkhorn (real speedup) for hard mode ---
     if cluster_mode == "hard" and use_per_cluster_sinkhorn:
         T_pq = _per_cluster_bary(
             z, w_pos, labels_z, labels_p, n_clusters,
             eps=eps, num_iter=num_iter,
             use_quadratic_cost=use_quadratic_cost,
-        )
+        ) if T_pq_global is None else T_pq_global
         T_qneg = _per_cluster_bary(
             z, w_neg, labels_z, labels_n, n_clusters,
             eps=eps, num_iter=num_iter,
@@ -816,7 +829,8 @@ def _compute_V_clustered(
                 centroids, centroids, cz, cp,
                 eps_gamma=outer_gamma_eps, num_iter=outer_gamma_iter,
             )
-            T_pq = _apply_outer_gamma(T_pq, labels_z, beta_p, off_p, z=z)
+            if cluster_pos:
+                T_pq = _apply_outer_gamma(T_pq, labels_z, beta_p, off_p, z=z)
             beta_n, off_n = _outer_gamma_targets(
                 centroids, centroids, cz, cn,
                 eps_gamma=outer_gamma_eps, num_iter=outer_gamma_iter,
@@ -847,7 +861,7 @@ def _compute_V_clustered(
 
     T_pq = _barycentric_map_clustered(
         z, w_pos, labels_z=labels_z, labels_s=labels_p, **bary_kw,
-    )
+    ) if T_pq_global is None else T_pq_global
     T_qneg = _barycentric_map_clustered(
         z, w_neg, labels_z=labels_z, labels_s=labels_n,
         target_weights=neg_target_weights, **bary_kw,
@@ -891,6 +905,7 @@ def drift_loss_ot(
     outer_gamma_eps: float = 0.01,
     outer_gamma_iter: int = 200,
     cluster_marg_p_pool: torch.Tensor | None = None,
+    cluster_pos: bool = True,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Debiased entropic-OT drifting loss.
 
@@ -1014,6 +1029,7 @@ def drift_loss_ot(
                     outer_gamma_eps=outer_gamma_eps,
                     outer_gamma_iter=outer_gamma_iter,
                     cluster_marg_p_pool=cluster_marg_p_pool,
+                    cluster_pos=cluster_pos,
                 )
                 f_norm = (V_raw ** 2).mean()
                 info[f"loss_{R}"] = f_norm
