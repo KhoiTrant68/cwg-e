@@ -30,7 +30,9 @@ EXP_NAME=${EXP_NAME:-cwge_smoke}
 WORKDIR=${WORKDIR:-./workdir/${EXP_NAME}}
 
 # wandb OFF by default (config has use_wandb: false)
+# DRIFT_COMPILE=0 — Tesla T4 lacks native bf16 compile; also cuts ~60s startup.
 NCCL_DEBUG=${NCCL_DEBUG:-WARN} \
+DRIFT_COMPILE=${DRIFT_COMPILE:-0} \
 torchrun \
     --nproc_per_node="$NGPU" \
     --master_port="$MASTER_PORT" \

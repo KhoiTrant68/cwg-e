@@ -33,7 +33,9 @@ dataset:
     prefetch_factor: 2
 
 model:
-  cond_dim: 768
+  # NOTE: LightningDiTBlock.adaLN_mod assumes cond_dim == hidden_size
+  # (block receives raw `c`, not projected). Keep them equal for smoke.
+  cond_dim: 384
   input_size: 32
   in_channels: 4
   patch_size: 2
@@ -51,7 +53,7 @@ model:
   n_cls_tokens: 8
   noise_classes: 8          # <= num_classes
   noise_coords: 16
-  use_bf16: true
+  use_bf16: false           # T4 has no native bf16 compile support
   attn_fp32: true
 
 optimizer:
