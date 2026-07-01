@@ -25,7 +25,7 @@ dataset:
   use_latent: true
   use_cache: true
   num_classes: 100          # <-- must match `ls <cache>/train_targets.npy` max+1
-  batch_size: 64
+  batch_size: 8
   eval_batch_size: 128
   kwargs:
     num_workers: 4
@@ -68,7 +68,7 @@ optimizer:
 
 train:
   diverse_noise: true
-  train_batch_size: 8
+  train_batch_size: 4
   seed: 42
   total_steps: 500
   save_per_step: 250
