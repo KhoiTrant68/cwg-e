@@ -627,7 +627,8 @@ def train_gen(
                     model_config=_generator_model_config(state.model),
                 )
 
-        if (step % eval_per_step == 0) or (step == 1) or (step == total_steps):
+        _skip_fid = os.environ.get("DRIFT_SKIP_FID", "0") != "0"
+        if not _skip_fid and ((step % eval_per_step == 0) or (step == 1) or (step == total_steps)):
             torch.cuda.empty_cache()
             is_sanity = step == 1
             n_samples = 500 if is_sanity else eval_samples
