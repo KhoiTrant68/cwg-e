@@ -1,0 +1,133 @@
+# ============================================================================
+# CWG-E smoke config — imagenet-mini (100 classes) on Kaggle T4/T4×2.
+#
+# Purpose:
+#   Verify the full W-Flow + CWG-E training pipeline end-to-end on a small
+#   latent cache. NOT tuned for quality — loss curves + sticky-refresh logs
+#   are the only signals we care about here.
+#
+# Prerequisites:
+#   - Latent cache at IMAGENET_CACHE_PATH from `python -m dataset.latent`
+#     over the imagenet-mini train/val folders.
+#   - Pretrained MAE + SD-VAE downloaded via misc/download_pretrained.py.
+#
+# Adjust `num_classes` to match the ImageFolder sub-directory count of your
+# imagenet-mini variant (some are 100 classes, some are 1000).
+# ============================================================================
+
+logging:
+  use_wandb: false          # smoke run — skip wandb setup
+  log_every_k: 10
+
+dataset:
+  resolution: 256
+  use_aug: false
+  use_latent: true
+  use_cache: true
+  num_classes: 100          # <-- must match `ls <cache>/train_targets.npy` max+1
+  batch_size: 64
+  eval_batch_size: 128
+  kwargs:
+    num_workers: 4
+    pin_memory: true
+    prefetch_factor: 2
+
+model:
+  cond_dim: 768
+  input_size: 32
+  in_channels: 4
+  patch_size: 2
+
+  hidden_size: 384          # half of full (768) — fits T4 memory
+  depth: 8                  # 12 → 8
+  num_heads: 8
+  mlp_ratio: 4.0
+  out_channels: 4
+
+  use_qknorm: true
+  use_swiglu: true
+  use_rope: true
+  use_rmsnorm: true
+  n_cls_tokens: 8
+  noise_classes: 8          # <= num_classes
+  noise_coords: 16
+  use_bf16: true
+  attn_fp32: true
+
+optimizer:
+  lr_schedule:
+    learning_rate: 0.0002
+    warmup_steps: 50
+    lr_schedule: "const"
+    total_steps: 500
+  weight_decay: 0.01
+  adam_b1: 0.9
+  adam_b2: 0.95
+
+train:
+  diverse_noise: true
+  train_batch_size: 8
+  seed: 42
+  total_steps: 500
+  save_per_step: 250
+  keep_every: 500
+  eval_per_step: 500        # only at end — FID would be garbage anyway
+  pos_per_sample: 8
+  neg_per_sample: 4
+  positive_bank_size: 32
+  negative_bank_size: 64
+  forward_dict:
+    gen_per_label: 4
+    cfg_min: 1.0
+    cfg_max: 4.0
+    neg_cfg_pw: 3.0
+  activation_kwargs:
+    patch_mean_size: [2, 4]
+    patch_std_size: [2, 4]
+    use_std: true
+    use_mean: true
+    every_k_block: 2
+  loss_kwargs:
+    R_list: [0.05]
+  cfg_list: [1.0, 2.0]
+  ema_decay: 0.999
+  push_per_step: 64
+  grad_accum_steps: 1
+
+  # --- OT loss config ---
+  ot_mode: "debiased"
+  ot_kwargs:
+    sinkhorn_num_iter: 10
+    use_new_cfg: true
+    disable_diag_mask: true
+    resample_neg: true
+    batch_sinkhorn: false
+    use_quadratic_cost: true
+
+    # --- CWG-E additions (all wired via train.py -> drift_loss_ot) ---
+    cluster_mode: "hard"      # "none" | "hard" | "soft"
+    n_clusters: 4             # 8 → 4 for smaller pool
+    mask_lambda: 1.0
+
+    use_per_cluster_sinkhorn: true
+    use_outer_gamma: true
+    outer_gamma_eps: 0.01
+    outer_gamma_iter: 200
+    cluster_pos: true
+
+    # --- Sticky population statistics ---
+    # With num_classes=100 and push_per_step=64, ~1 pass over classes takes
+    # ~50 steps. Warmup=100 ensures each class has ≥1 bank entry before we
+    # sample sticky_samples_per_class from it.
+    sticky_warmup_steps: 100
+    sticky_refresh_steps: 0   # frozen after first compute (2D-benchmark default)
+    sticky_samples_per_class: 4
+    sticky_max_pool_tokens: 20000     # per-rank cap = 20000 / world
+    sticky_extract_chunk: 128         # keep MAE fwd small on T4
+    sticky_kmeans_iter: 30
+    sticky_kmeans_iter_warm: 10
+
+feature:
+  mae_path: "hf://mae_latent_256"
+  use_mae: true
+  use_convnext: false
